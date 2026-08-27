@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Record Idea Hub</string>
+    <string name="notification_channel">Запись идей</string>
+</resources>

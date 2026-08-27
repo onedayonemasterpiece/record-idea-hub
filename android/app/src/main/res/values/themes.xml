@@ -1,0 +1,11 @@
+<resources>
+    <style name="Theme.RecordIdeaHub" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowBackground">#101114</item>
+        <item name="android:colorAccent">#D9E2FF</item>
+        <item name="android:navigationBarColor">#101114</item>
+        <item name="android:statusBarColor">#101114</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
