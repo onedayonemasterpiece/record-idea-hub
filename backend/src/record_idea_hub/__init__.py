@@ -1,0 +1,3 @@
+"""Record Idea Hub backend."""
+
+__version__ = "0.1.0"

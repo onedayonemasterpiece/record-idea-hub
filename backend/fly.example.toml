@@ -1,0 +1,31 @@
+app = "record-idea-hub-change-me"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  RECORD_IDEA_HUB_DATA_DIR = "/data"
+  GEMINI_LITE_MODEL = "gemini-3.1-flash-lite"
+  IDEA_HUB_GITHUB_REPOSITORY = "onedayonemasterpiece/idea-hub"
+  IDEA_HUB_GITHUB_BRANCH = "main"
+  GOOGLE_AI_ALLOW_RESERVE_FALLBACK = "0"
+  GOOGLE_AI_LOCAL_LIMITER_FALLBACK = "0"
+  GOOGLE_AI_LOCAL_LIMITER_ON_RESERVE_ERROR = "0"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[mounts]
+  source = "record_idea_hub_data"
+  destination = "/data"
