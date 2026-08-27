@@ -14,7 +14,7 @@ def test_database_tracks_chunk_progress_and_idempotency(tmp_path: Path) -> None:
         timezone="America/Indiana/Indianapolis",
         device_label="Samsung S21 Ultra",
     )
-    row, duplicate = db.put_chunk(
+    _row, duplicate = db.put_chunk(
         session_id="voice-20260827-dbtest01",
         chunk_index=0,
         start_ms=0,

@@ -21,7 +21,7 @@ class Settings:
     events_bot_ref: str = "8710e56fa3685f6c30a90cd062d532dce0348cce"
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         model = (os.getenv("GEMINI_LITE_MODEL") or "gemini-3.1-flash-lite").strip()
         if "flash-lite" not in model.lower():
             raise ConfigurationError(

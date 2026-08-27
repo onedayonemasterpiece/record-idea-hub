@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 
