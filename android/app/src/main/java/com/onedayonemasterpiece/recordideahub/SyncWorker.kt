@@ -105,7 +105,19 @@ class SyncWorker(
         val progress = if (!session.completeSent) {
             api.completeSession(session, chunks).also { store.markCompleteSent(session.sessionId) }
         } else {
-            api.status(session.sessionId)
+            val current = api.status(session.sessionId)
+            // The exact same authenticated complete manifest is the server's safe retry signal.
+            // It requeues only a typed pre-send/retryable failure and never replays a durable
+            // transcript, summary, or an ambiguous already-sent provider attempt.
+            if (
+                current.state == RemoteState.RETRYABLE_ERROR &&
+                current.retryable &&
+                !current.reconciliationRequired
+            ) {
+                api.completeSession(session, chunks)
+            } else {
+                current
+            }
         }
         store.updateRemoteProgress(session.sessionId, progress)
         when {
