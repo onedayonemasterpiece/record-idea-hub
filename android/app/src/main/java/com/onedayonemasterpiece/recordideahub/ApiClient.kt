@@ -6,97 +6,183 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
+import java.time.Instant
+import java.time.OffsetDateTime
 import java.util.Locale
+import kotlin.math.ceil
 
-class ApiClient(
-    private val baseUrl: String,
-    private val token: String,
-) {
-    fun createSession(session: SessionSnapshot): RemoteProgress = jsonRequest(
-        method = "POST",
-        path = "$API_ROOT/sessions",
-        body = JSONObject()
+class ApiClientV1(baseUrl: String, token: String) {
+    private val http = VoiceHttpClient(baseUrl, token)
+
+    fun createSession(session: SessionSnapshot): RemoteProgress = http.jsonRequest(
+        "POST", "$API_ROOT/sessions", JSONObject()
             .put("session_id", session.sessionId)
             .put("started_at", session.startedAt)
             .put("timezone", session.timezone)
-            .put("device_label", session.deviceLabel)
-            .toString()
-            .toByteArray(StandardCharsets.UTF_8),
-    ).toProgress()
+            .put("device_label", session.deviceLabel).toBytes(),
+    ).toProgressV1()
 
     fun uploadChunk(chunk: ChunkRecord): ChunkTranscriptResult {
-        val file = File(chunk.path)
-        require(file.isFile) { "missing local audio chunk ${chunk.path}" }
-        val connection = open(
-            "PUT",
+        val response = http.upload(
             "$API_ROOT/sessions/${chunk.sessionId}/chunks/${chunk.chunkIndex}",
+            File(chunk.path),
+            "audio/wav",
+            mapOf(
+                "X-Chunk-SHA256" to chunk.sha256,
+                "X-Chunk-Duration-Ms" to chunk.durationMs.coerceAtLeast(1L).toString(),
+            ),
         )
-        connection.setRequestProperty("Content-Type", "audio/wav")
-        connection.setRequestProperty("X-Chunk-SHA256", chunk.sha256)
-        connection.setRequestProperty(
-            "X-Chunk-Duration-Ms",
-            (chunk.endMs - chunk.startMs).coerceAtLeast(1L).toString(),
-        )
-        connection.setFixedLengthStreamingMode(file.length())
-        connection.doOutput = true
-        file.inputStream().use { input ->
-            connection.outputStream.use { output -> input.copyTo(output) }
-        }
-        val response = readJson(connection)
-        val transcript = response.getJSONObject("transcript")
         return ChunkTranscriptResult(
-            transcriptJson = transcript.toString(),
+            transcriptJson = response.getJSONObject("transcript").toString(),
             model = response.getString("model"),
             requestUid = response.getString("request_uid"),
         )
     }
 
-    fun completeSession(
-        session: SessionSnapshot,
-        chunks: List<ChunkRecord>,
-    ): RemoteProgress {
-        require(chunks.isNotEmpty()) { "cannot complete a session without chunks" }
-        require(chunks.size == session.chunkCount) { "local chunk count changed before completion" }
-        val ordered = chunks.sortedBy { it.chunkIndex }
-        require(ordered.map { it.chunkIndex } == ordered.indices.toList()) {
-            "local chunks must be contiguous and ordered"
-        }
-        val chunkArray = JSONArray()
-        for (chunk in ordered) {
-            val transcript = chunk.transcriptJson
-                ?: error("chunk ${chunk.chunkIndex} has no durable transcript")
-            chunkArray.put(
+    fun completeSession(session: SessionSnapshot, chunks: List<ChunkRecord>): RemoteProgress {
+        val ordered = requireOrderedChunks(session, chunks)
+        val array = JSONArray()
+        ordered.forEach { chunk ->
+            array.put(
                 JSONObject()
                     .put("chunk_index", chunk.chunkIndex)
                     .put("start_ms", chunk.startMs)
                     .put("end_ms", chunk.endMs)
                     .put("sha256", chunk.sha256)
-                    .put("transcript", JSONObject(transcript)),
+                    .put("transcript", JSONObject(chunk.transcriptJson ?: error("missing legacy transcript"))),
             )
         }
-        return jsonRequest(
-            method = "POST",
-            path = "$API_ROOT/sessions/${session.sessionId}/complete",
-            body = JSONObject()
+        return http.jsonRequest(
+            "POST", "$API_ROOT/sessions/${session.sessionId}/complete", JSONObject()
                 .put("started_at", session.startedAt)
                 .put("ended_at", requireNotNull(session.endedAt))
                 .put("timezone", session.timezone)
                 .put("device_label", session.deviceLabel)
                 .put("duration_ms", session.durationMs)
                 .put("chunk_count", session.chunkCount)
-                .put("chunks", chunkArray)
-                .toString()
-                .toByteArray(StandardCharsets.UTF_8),
-        ).toProgress()
+                .put("chunks", array)
+                .toBytes(),
+        ).toProgressV1()
     }
 
-    fun status(sessionId: String): RemoteProgress = jsonRequest(
-        method = "GET",
-        path = "$API_ROOT/sessions/$sessionId",
-        body = null,
-    ).toProgress()
+    fun status(sessionId: String): RemoteProgress =
+        http.jsonRequest("GET", "$API_ROOT/sessions/$sessionId", null).toProgressV1()
 
-    private fun jsonRequest(method: String, path: String, body: ByteArray?): JSONObject {
+    companion object {
+        private const val API_ROOT = "/voice-intake/v1"
+    }
+}
+
+class ApiClientV2(baseUrl: String, token: String) {
+    private val http = VoiceHttpClient(baseUrl, token)
+
+    fun createSession(session: SessionSnapshot): RemoteProgress {
+        val body = JSONObject()
+            .put("session_id", session.sessionId)
+            .put("started_at", session.startedAt)
+            .put("timezone", session.timezone)
+            .put("device_label", session.deviceLabel)
+            .put("client_version", BuildConfig.VERSION_NAME)
+            .put("capture_policy", session.capturePolicy)
+            .put(
+                "audio_format",
+                JSONObject()
+                    .put("container", AudioProfile.CONTAINER)
+                    .put("codec", AudioProfile.CODEC)
+                    .put("mime_type", AudioProfile.MIME_M4A)
+                    .put("sample_rate_hz", AudioProfile.SAMPLE_RATE_HZ)
+                    .put("channels", AudioProfile.CHANNELS)
+                    .put("target_bitrate_bps", AudioProfile.BITRATE_BPS),
+            )
+        if (session.vadEngine.isNullOrBlank()) {
+            body.put("vad", JSONObject.NULL)
+        } else {
+            body.put(
+                "vad",
+                JSONObject()
+                    .put("engine", session.vadEngine)
+                    .put("engine_version", EfficientVad.ENGINE_VERSION)
+                    .put("mode", EfficientVad.MODE)
+                    .put("frame_ms", EfficientVad.FRAME_MS)
+                    .put("config_version", EfficientVad.CONFIG_VERSION),
+            )
+        }
+        return http.jsonRequest("POST", "$API_ROOT/sessions", body.toBytes())
+            .requireV2Session(session.sessionId)
+            .toProgressV2()
+    }
+
+    fun uploadChunk(chunk: ChunkRecord): ChunkUploadReceipt {
+        val response = http.upload(
+            "$API_ROOT/sessions/${chunk.sessionId}/chunks/${chunk.chunkIndex}",
+            File(chunk.path),
+            chunk.mimeType,
+            mapOf(
+                "X-Chunk-SHA256" to chunk.sha256,
+                "X-Chunk-Duration-Ms" to chunk.durationMs.coerceAtLeast(1L).toString(),
+                "X-Audio-Start-Ms" to chunk.startMs.toString(),
+                "X-Audio-End-Ms" to chunk.endMs.toString(),
+                "X-Wall-Start-Ms" to chunk.wallStartMs.toString(),
+                "X-Wall-End-Ms" to chunk.wallEndMs.toString(),
+            ),
+        ).requireV2Session(chunk.sessionId)
+        val receiptMatches =
+            response.optBoolean("accepted", false) &&
+                response.optInt("chunk_index", -1) == chunk.chunkIndex &&
+                response.optString("sha256") == chunk.sha256 &&
+                response.optLong("duration_ms", -1L) == chunk.durationMs
+        if (!receiptMatches) throw contractMismatch("chunk_receipt_mismatch")
+        return ChunkUploadReceipt(
+            chunkIndex = chunk.chunkIndex,
+            accepted = true,
+            duplicate = response.optBoolean("duplicate", false),
+            chunksReceived = response.optInt("chunks_received", 0),
+            bytesReceived = response.optLong("bytes_received", 0L),
+        )
+    }
+
+    fun completeSession(session: SessionSnapshot, chunks: List<ChunkRecord>): RemoteProgress {
+        val ordered = requireOrderedChunks(session, chunks)
+        val manifest = JSONArray()
+        ordered.forEach { chunk ->
+            manifest.put(
+                JSONObject()
+                    .put("chunk_index", chunk.chunkIndex)
+                    .put("sha256", chunk.sha256)
+                    .put("duration_ms", chunk.durationMs)
+                    .put("audio_start_ms", chunk.startMs)
+                    .put("audio_end_ms", chunk.endMs)
+                    .put("wall_start_ms", chunk.wallStartMs)
+                    .put("wall_end_ms", chunk.wallEndMs),
+            )
+        }
+        return http.jsonRequest(
+            "POST", "$API_ROOT/sessions/${session.sessionId}/complete", JSONObject()
+                .put("ended_at", requireNotNull(session.endedAt))
+                .put("wall_elapsed_ms", session.wallElapsedMs)
+                .put("manual_pause_ms", session.manualPauseMs)
+                .put("recorded_audio_ms", session.durationMs)
+                .put("auto_silence_skipped_ms", session.autoSilenceSkippedMs)
+                .put("chunk_count", session.chunkCount)
+                .put("chunks", manifest)
+                .toBytes(),
+        ).requireV2Session(session.sessionId).toProgressV2()
+    }
+
+    fun status(sessionId: String): RemoteProgress =
+        http.jsonRequest("GET", "$API_ROOT/sessions/$sessionId", null)
+            .requireV2Session(sessionId)
+            .toProgressV2()
+
+    companion object {
+        private const val API_ROOT = "/voice-intake/v2"
+    }
+}
+
+private class VoiceHttpClient(baseUrl: String, private val token: String) {
+    private val serviceBaseUrl = VoiceIntakeV2Policy.normalizeServiceBaseUrl(baseUrl)
+
+    fun jsonRequest(method: String, path: String, body: ByteArray?): JSONObject {
         val connection = open(method, path)
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
         if (body != null) {
@@ -107,17 +193,29 @@ class ApiClient(
         return readJson(connection)
     }
 
-    private fun open(method: String, path: String): HttpURLConnection {
-        val connection = URL(baseUrl.trimEnd('/') + path).openConnection() as HttpURLConnection
-        connection.requestMethod = method
-        connection.connectTimeout = 15_000
-        connection.readTimeout = 240_000
-        connection.useCaches = false
-        connection.setRequestProperty("Authorization", "Bearer $token")
-        connection.setRequestProperty("Accept", "application/json")
-        connection.setRequestProperty("User-Agent", "record-idea-hub-android/0.2")
-        return connection
+    fun upload(path: String, file: File, mimeType: String, headers: Map<String, String>): JSONObject {
+        require(file.isFile) { "missing local audio chunk ${file.absolutePath}" }
+        val connection = open("PUT", path)
+        connection.setRequestProperty("Content-Type", mimeType)
+        headers.forEach(connection::setRequestProperty)
+        connection.setFixedLengthStreamingMode(file.length())
+        connection.doOutput = true
+        file.inputStream().use { input ->
+            connection.outputStream.use { output -> input.copyTo(output) }
+        }
+        return readJson(connection)
     }
+
+    private fun open(method: String, path: String): HttpURLConnection =
+        (URL(serviceBaseUrl + path).openConnection() as HttpURLConnection).apply {
+            requestMethod = method
+            connectTimeout = 15_000
+            readTimeout = 180_000
+            useCaches = false
+            setRequestProperty("Authorization", "Bearer $token")
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("User-Agent", "record-idea-hub-android/${BuildConfig.VERSION_NAME}")
+        }
 
     private fun readJson(connection: HttpURLConnection): JSONObject {
         try {
@@ -134,41 +232,48 @@ class ApiClient(
     private fun parseError(httpCode: Int, text: String): ApiException {
         val root = runCatching { JSONObject(text) }.getOrNull()
         val detail = root?.optJSONObject("detail")
-        val code = detail?.optString("code")
-            ?.takeIf { it.isNotBlank() }
+        val code = detail?.optString("code")?.takeIf { it.isNotBlank() }
+            ?: root?.optString("detail")?.takeIf { it.isNotBlank() }
             ?: "http_$httpCode"
         val retryable = detail?.optBoolean("retryable", httpCode == 429 || httpCode >= 500)
             ?: (httpCode == 429 || httpCode >= 500)
         val retryAfter = detail?.let {
             if (it.has("retry_after_seconds") && !it.isNull("retry_after_seconds")) {
-                it.optInt("retry_after_seconds").takeIf { seconds -> seconds > 0 }
+                it.optInt("retry_after_seconds").takeIf { value -> value > 0 }
             } else {
                 null
             }
         }
-        val reconciliationRequired = detail?.optBoolean("reconciliation_required", false) ?: false
+        val reconcile = detail?.optBoolean("reconciliation_required", false) ?: false
         return ApiException(
-            message = humanMessage(code, retryAfter),
-            code = code,
-            retryable = retryable,
-            retryAfterSeconds = retryAfter,
-            reconciliationRequired = reconciliationRequired,
+            humanMessage(code, retryAfter, reconcile),
+            code,
+            retryable,
+            retryAfter,
+            reconcile,
         )
     }
 
-    private fun humanMessage(code: String, retryAfterSeconds: Int?): String {
-        val wait = retryAfterSeconds?.let { " Повтор через ${formatWait(it)}." }.orEmpty()
+    private fun humanMessage(code: String, retry: Int?, reconcile: Boolean): String {
+        val wait = retry?.let { " Повтор не раньше чем через ${formatWait(it)}." }.orEmpty()
         return when {
-            code == "provider_429" || code.startsWith("quota_exhausted_") ->
+            reconcile || VoiceIntakeV2Policy.requiresManualReconciliation(code, false) ->
+                "Нужна безопасная сверка с сервером; аудио сохранено на телефоне."
+            VoiceIntakeV2Policy.isQuotaCode(code) ->
                 "Доступный лимит Gemini временно исчерпан.$wait Аудио сохранено на телефоне."
             code.contains("limiter") || code.contains("reservation") ->
-                "Общий контроль лимитов недоступен.$wait Аудио сохранено на телефоне."
+                "Общий контроль лимитов временно недоступен.$wait Аудио сохранено на телефоне."
             code.startsWith("provider_") ->
-                "Gemini временно не завершил обработку.$wait Аудио сохранено на телефоне."
+                "Gemini не завершил обработку.$wait Аудио сохранено."
             code.startsWith("github_") || code.startsWith("idea_hub_") ->
-                "Расшифровка сохранена локально, но GitHub ещё не подтверждён.$wait"
-            code == "chunk_sha256_mismatch" ->
-                "Сервер отклонил повреждённый аудиочанк; исходный файл сохранён."
+                "Расшифровка готова, но GitHub ещё не подтверждён.$wait"
+            code == "chunks_missing" ->
+                "Серверу не хватает одного или нескольких сегментов; они будут проверены повторно."
+            code == "session_not_created" || code.contains("session_not_initialized") ||
+                code.contains("terminology_not_initialized") ->
+                "Серверная сессия будет безопасно создана повторно."
+            code == "device_token_required" || code == "device_token_invalid" ->
+                "Проверьте device token в настройках; аудио сохранено локально."
             else -> "Стадия не завершена ($code).$wait Исходные данные сохранены."
         }
     }
@@ -182,23 +287,133 @@ class ApiClient(
             "$remainder с"
         }
     }
+}
 
-    private fun JSONObject.toProgress() = RemoteProgress(
-        state = getString("state"),
+private fun requireOrderedChunks(session: SessionSnapshot, chunks: List<ChunkRecord>): List<ChunkRecord> {
+    require(chunks.isNotEmpty()) { "cannot complete a session without chunks" }
+    require(chunks.size == session.chunkCount) { "local chunk count changed before completion" }
+    return chunks.sortedBy { it.chunkIndex }.also { ordered ->
+        require(ordered.map { it.chunkIndex } == ordered.indices.toList()) {
+            "chunks must be contiguous"
+        }
+        if (session.protocolVersion >= 2) {
+            require(ordered.first().startMs == 0L) { "audio timeline must start at zero" }
+            ordered.forEach { chunk ->
+                require(chunk.durationMs > 0L) { "chunk duration must be positive" }
+                require(chunk.wallEndMs > chunk.wallStartMs) { "chunk wall range must increase" }
+            }
+            ordered.zipWithNext().forEach { (previous, current) ->
+                require(current.startMs == previous.endMs) { "audio timeline must be contiguous" }
+                require(current.wallStartMs >= previous.wallEndMs) { "wall timeline must not overlap" }
+            }
+            require(ordered.last().endMs == session.durationMs) {
+                "audio timeline must match recorded duration"
+            }
+            require(ordered.last().wallEndMs <= session.wallElapsedMs) {
+                "wall timeline must not exceed session elapsed time"
+            }
+            require(
+                session.durationMs + session.manualPauseMs + session.autoSilenceSkippedMs ==
+                    session.wallElapsedMs,
+            ) { "session duration accounting must balance" }
+        }
+    }
+}
+
+private fun JSONObject.requireV2Session(expectedSessionId: String): JSONObject {
+    if (optString("api_version") != "2.0") throw contractMismatch("api_version_mismatch")
+    if (optString("session_id") != expectedSessionId) throw contractMismatch("session_receipt_mismatch")
+    return this
+}
+
+private fun contractMismatch(code: String): Nothing = throw contractMismatchException(code)
+
+private fun contractMismatchException(code: String) = ApiException(
+    message = "Ответ Voice Intake v2 не совпадает с закреплённым контрактом; аудио сохранено.",
+    code = code,
+    retryable = false,
+    retryAfterSeconds = null,
+    reconciliationRequired = true,
+)
+
+private fun JSONObject.toBytes() = toString().toByteArray(StandardCharsets.UTF_8)
+
+private fun JSONObject.nullableString(name: String): String? =
+    if (!has(name) || isNull(name)) null else optString(name).takeIf { it.isNotBlank() && it != "null" }
+
+private fun JSONObject.nullableInt(name: String): Int? =
+    if (!has(name) || isNull(name)) null else optInt(name)
+
+private fun retryAfterFromTimestamp(value: String?): Int? {
+    if (value.isNullOrBlank()) return null
+    val epoch = runCatching { Instant.parse(value).toEpochMilli() }
+        .recoverCatching { OffsetDateTime.parse(value).toInstant().toEpochMilli() }
+        .getOrNull() ?: return null
+    val remainingMs = epoch - System.currentTimeMillis()
+    if (remainingMs <= 0L) return 0
+    return ceil(remainingMs / 1000.0)
+        .coerceAtMost(Int.MAX_VALUE.toDouble())
+        .toInt()
+        .coerceAtLeast(1)
+}
+
+private fun JSONObject.toProgressV1(): RemoteProgress {
+    val verified = optBoolean("github_verified", false)
+    return RemoteProgress(
+        state = optString("state", RemoteState.PROCESSING),
         recordingFinished = optBoolean("recording_finished", false),
-        chunksExpected = if (isNull("chunks_expected")) null else optInt("chunks_expected"),
+        chunksExpected = nullableInt("chunks_expected"),
         chunksUploaded = optInt("chunks_uploaded", 0),
         chunksTranscribed = optInt("chunks_transcribed", 0),
-        githubVerified = optBoolean("github_verified", false),
-        githubUrl = optString("github_url").takeIf { it.isNotBlank() && it != "null" },
-        githubCommitSha = optString("github_commit_sha").takeIf { it.isNotBlank() && it != "null" },
-        lastError = optString("last_error").takeIf { it.isNotBlank() && it != "null" },
-        retryAfterSeconds = if (isNull("retry_after_seconds")) null else optInt("retry_after_seconds"),
+        geminiRequestsTotal = 0,
+        geminiRequestsCompleted = 0,
+        transcriptionComplete = verified,
+        summaryComplete = verified,
+        githubVerified = verified,
+        serverAudioPurged = verified,
+        githubUrl = nullableString("github_url"),
+        githubCommitSha = nullableString("github_commit_sha"),
+        lastError = nullableString("last_error"),
+        errorCode = null,
+        retryable = false,
+        retryAfterSeconds = nullableInt("retry_after_seconds"),
+        reconciliationRequired = false,
     )
+}
 
-    companion object {
-        private const val API_ROOT = "/voice-intake/v1"
+private fun JSONObject.toProgressV2(): RemoteProgress {
+    val transcriptionComplete = optBoolean("transcription_complete", false)
+    val expected = optInt("chunks_expected", optInt("chunks_received", 0))
+    val verified = optBoolean("github_verified", false)
+    val purged = optBoolean("server_audio_purged", false)
+    val rawState = optString("state", RemoteState.RECEIVING)
+    val safeState = if (rawState == RemoteState.PUBLISHED_VERIFIED && (!verified || !purged)) {
+        RemoteState.VERIFYING
+    } else {
+        rawState
     }
+    val retryAfter = nullableInt("retry_after_seconds")
+        ?: retryAfterFromTimestamp(nullableString("retry_at"))
+    return RemoteProgress(
+        state = safeState,
+        recordingFinished = optBoolean("recording_finished", false),
+        chunksExpected = nullableInt("chunks_expected"),
+        chunksUploaded = optInt("chunks_received", optInt("chunks_uploaded", 0)),
+        chunksTranscribed = if (transcriptionComplete) expected else 0,
+        geminiRequestsTotal = optInt("gemini_requests_total", 2),
+        geminiRequestsCompleted = optInt("gemini_requests_completed", 0),
+        transcriptionComplete = transcriptionComplete,
+        summaryComplete = optBoolean("summary_complete", false),
+        githubVerified = verified,
+        serverAudioPurged = purged,
+        githubUrl = nullableString("github_url"),
+        githubCommitSha = nullableString("github_commit_sha"),
+        lastError = null,
+        errorCode = nullableString("error_code"),
+        retryable = optBoolean("retryable", false),
+        retryAfterSeconds = retryAfter,
+        reconciliationRequired = optBoolean("reconciliation_required", false),
+    )
 }
 
 class ApiException(

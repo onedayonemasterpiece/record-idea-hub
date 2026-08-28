@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - "feat/**"
   pull_request:
   workflow_dispatch:
 
@@ -49,10 +48,17 @@ jobs:
         run: >-
           gradle -p android --no-daemon --stacktrace
           lintDebug testDebugUnitTest assembleDebug
-      - name: Upload installable debug APK
+      - name: Prepare versioned APK artifact
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp android/app/build/outputs/apk/debug/app-debug.apk \
+            artifacts/record-idea-hub-1.1.0-rc2-debug.apk
+          (cd artifacts && sha256sum record-idea-hub-1.1.0-rc2-debug.apk > SHA256SUMS.txt)
+      - name: Upload installable Android 1.1 RC2 APK
         uses: actions/upload-artifact@v7
         with:
-          name: record-idea-hub-debug-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: record-idea-hub-1.1-rc2-apk
+          path: artifacts/
           if-no-files-found: error
           retention-days: 14

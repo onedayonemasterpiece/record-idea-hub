@@ -9,4 +9,14 @@
     <issue id="UnspecifiedRegisterReceiverFlag">
         <ignore path="src/main/java/com/onedayonemasterpiece/recordideahub/MainActivity.kt" />
     </issue>
+
+    <!--
+      RecordingService checks RECORD_AUDIO immediately before starting the capture
+      thread and handles SecurityException/runtime revocation while constructing and
+      starting AudioRecord. Lint cannot follow that cross-method foreground-service
+      guard, so suppress only the guarded capture implementation.
+    -->
+    <issue id="MissingPermission">
+        <ignore path="src/main/java/com/onedayonemasterpiece/recordideahub/RecordingService.kt" />
+    </issue>
 </lint>
