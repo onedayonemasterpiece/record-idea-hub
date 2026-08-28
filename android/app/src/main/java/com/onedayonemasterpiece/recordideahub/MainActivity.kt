@@ -27,6 +27,9 @@ import android.widget.ProgressBar
 import android.widget.Space
 import android.widget.TextView
 import android.widget.Toast
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import kotlin.math.max
 
 class MainActivity : Activity() {
@@ -38,6 +41,7 @@ class MainActivity : Activity() {
     private lateinit var timer: TextView
     private lateinit var primary: Button
     private lateinit var finish: Button
+    private lateinit var retry: Button
     private lateinit var captureStatus: TextView
     private lateinit var uploadStatus: TextView
     private lateinit var transcriptionStatus: TextView
@@ -102,11 +106,17 @@ class MainActivity : Activity() {
         }
         root.addView(
             content,
-            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT),
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
         )
 
         val top = FrameLayout(this)
-        content.addView(top, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)))
+        content.addView(
+            top,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)),
+        )
         top.addView(
             TextView(this).apply {
                 text = "Record Idea Hub"
@@ -115,7 +125,11 @@ class MainActivity : Activity() {
                 setTypeface(typeface, Typeface.BOLD)
                 gravity = Gravity.CENTER_VERTICAL
             },
-            FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.START),
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                Gravity.START,
+            ),
         )
         top.addView(
             Button(this).apply {
@@ -124,9 +138,13 @@ class MainActivity : Activity() {
                 setTextColor(MUTED)
                 setBackgroundColor(Color.TRANSPARENT)
                 setOnClickListener { showSettings() }
-                contentDescription = "Настройки"
+                contentDescription = "Настройки my-data-hub"
             },
-            FrameLayout.LayoutParams(dp(56), FrameLayout.LayoutParams.MATCH_PARENT, Gravity.END),
+            FrameLayout.LayoutParams(
+                dp(56),
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                Gravity.END,
+            ),
         )
 
         timer = TextView(this).apply {
@@ -136,7 +154,10 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
             setTypeface(Typeface.MONOSPACE, Typeface.NORMAL)
         }
-        content.addView(timer, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(82)))
+        content.addView(
+            timer,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(82)),
+        )
 
         val statusCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -145,7 +166,10 @@ class MainActivity : Activity() {
         }
         content.addView(
             statusCard,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply {
                 bottomMargin = dp(20)
             },
         )
@@ -159,7 +183,25 @@ class MainActivity : Activity() {
         }
         statusCard.addView(
             progress,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(5)).apply { topMargin = dp(10) },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(5)).apply {
+                topMargin = dp(10)
+            },
+        )
+
+        retry = Button(this).apply {
+            text = "Повторить сейчас"
+            isAllCaps = false
+            textSize = 14f
+            setTextColor(FOREGROUND)
+            background = rounded(0xFF272A31.toInt(), 16f)
+            visibility = View.GONE
+            setOnClickListener { retryLatest() }
+        }
+        content.addView(
+            retry,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(46)).apply {
+                bottomMargin = dp(12)
+            },
         )
 
         content.addView(Space(this), LinearLayout.LayoutParams(1, 0, 1f))
@@ -174,12 +216,14 @@ class MainActivity : Activity() {
         content.addView(primary, LinearLayout.LayoutParams(dp(220), dp(220)))
 
         finish = Button(this).apply {
-            text = "Завершить сессию"
+            text = "Завершить и отправить"
             isAllCaps = false
             textSize = 16f
             setTextColor(FOREGROUND)
             background = rounded(0xFF272A31.toInt(), 18f)
-            setOnClickListener { RecordingService.command(this@MainActivity, RecordingService.ACTION_FINISH) }
+            setOnClickListener {
+                RecordingService.command(this@MainActivity, RecordingService.ACTION_FINISH)
+            }
         }
         content.addView(
             finish,
@@ -189,7 +233,7 @@ class MainActivity : Activity() {
         )
 
         resultLink = TextView(this).apply {
-            text = "Открыть запись в GitHub"
+            text = "Открыть запись в IdeaHub"
             textSize = 15f
             setTextColor(0xFF9DB7FF.toInt())
             gravity = Gravity.CENTER
@@ -200,7 +244,10 @@ class MainActivity : Activity() {
                 startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
             }
         }
-        content.addView(resultLink, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52)))
+        content.addView(
+            resultLink,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(52)),
+        )
         content.addView(Space(this), LinearLayout.LayoutParams(1, 0, 1f))
         setContentView(root)
     }
@@ -209,51 +256,64 @@ class MainActivity : Activity() {
         view.textSize = 15f
         view.setTextColor(MUTED)
         view.setPadding(0, dp(4), 0, dp(4))
-        parent.addView(view, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(30)))
+        view.maxLines = 2
+        parent.addView(
+            view,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(36)),
+        )
     }
 
     private fun refresh() {
         val active = store.activeSession()
         val latest = active ?: store.latestSession()
-        val duration = if (latest == null) 0L else max(
-            latest.durationMs,
-            runtime.durationFor(latest.sessionId) ?: 0L,
-        )
+        val duration = if (latest == null) {
+            0L
+        } else {
+            max(latest.durationMs, runtime.durationFor(latest.sessionId) ?: 0L)
+        }
         timer.text = formatDuration(duration)
 
         if (latest == null) {
-            captureStatus.text = "Запись              ○ не идёт"
-            uploadStatus.text = "Отправка           ○ нет данных"
-            transcriptionStatus.text = "Распознавание  ○ нет данных"
-            githubStatus.text = "GitHub              ○ нет данных"
+            captureStatus.text = "Запись            ○ не идёт"
+            uploadStatus.text = "Передача        ○ нет данных"
+            transcriptionStatus.text = "Распознано    ○ нет данных"
+            githubStatus.text = "IdeaHub           ○ нет данных"
             progress.progress = 0
             primary.text = "Записать"
             primary.isEnabled = true
             finish.visibility = View.GONE
+            retry.visibility = View.GONE
             resultLink.visibility = View.GONE
             return
         }
 
         val total = latest.chunkCount.coerceAtLeast(1)
         captureStatus.text = when (latest.captureState) {
-            CaptureState.RECORDING -> "Запись              ● идёт"
-            CaptureState.PAUSED -> "Запись              Ⅱ пауза"
-            CaptureState.FINISHED -> "Запись              ✓ сохранена"
-            else -> "Запись              ○ не идёт"
+            CaptureState.RECORDING -> "Запись            ● идёт"
+            CaptureState.PAUSED -> "Запись            Ⅱ пауза"
+            CaptureState.FINISHED -> "Запись            ✓ сохранена локально"
+            else -> "Запись            ○ не идёт"
         }
-        uploadStatus.text = "Отправка           ${mark(latest.chunksUploaded >= latest.chunkCount && latest.chunkCount > 0)} ${latest.chunksUploaded}/${latest.chunkCount}"
-        transcriptionStatus.text = "Распознавание  ${mark(latest.chunksTranscribed >= latest.chunkCount && latest.chunkCount > 0)} ${latest.chunksTranscribed}/${latest.chunkCount}"
-        githubStatus.text = when (latest.remoteState) {
-            RemoteState.PUBLISHED_VERIFIED -> "GitHub              ✓ записано и проверено"
-            RemoteState.PUBLISHING -> "GitHub              ● создаётся commit"
-            RemoteState.WAITING_FOR_QUOTA -> "GitHub              ◌ ожидание лимита"
-            RemoteState.RETRYABLE_ERROR -> "GitHub              ! повторная попытка"
-            else -> "GitHub              ○ ожидает"
+        uploadStatus.text = buildString {
+            append("Передача        ")
+            append(mark(latest.chunksUploaded >= latest.chunkCount && latest.chunkCount > 0))
+            append(" ${latest.chunksUploaded}/${latest.chunkCount}")
         }
-        val capturePart = if (latest.captureState == CaptureState.FINISHED) 25 else 10
-        val uploadPart = (25.0 * latest.chunksUploaded / total).toInt().coerceIn(0, 25)
-        val transcriptPart = (25.0 * latest.chunksTranscribed / total).toInt().coerceIn(0, 25)
-        val githubPart = if (latest.remoteState == RemoteState.PUBLISHED_VERIFIED) 25 else 0
+        transcriptionStatus.text = buildString {
+            append("Распознано    ")
+            append(mark(latest.chunksTranscribed >= latest.chunkCount && latest.chunkCount > 0))
+            append(" ${latest.chunksTranscribed}/${latest.chunkCount}")
+        }
+        githubStatus.text = processLabel(latest)
+
+        val capturePart = if (latest.captureState == CaptureState.FINISHED) 20 else 8
+        val uploadPart = (20.0 * latest.chunksUploaded / total).toInt().coerceIn(0, 20)
+        val transcriptPart = (35.0 * latest.chunksTranscribed / total).toInt().coerceIn(0, 35)
+        val githubPart = when (latest.remoteState) {
+            RemoteState.PUBLISHING -> 12
+            RemoteState.PUBLISHED_VERIFIED -> 25
+            else -> 0
+        }
         progress.progress = (capturePart + uploadPart + transcriptPart + githubPart).coerceIn(0, 100)
 
         when (active?.captureState) {
@@ -273,11 +333,47 @@ class MainActivity : Activity() {
                 finish.visibility = View.GONE
             }
         }
-        resultLink.visibility = if (latest.githubUrl != null) View.VISIBLE else View.GONE
-        latest.lastError?.takeIf { it.isNotBlank() }?.let {
-            githubStatus.text = "Процесс             ! ${it.take(46)}"
+        retry.visibility = if (
+            latest.remoteState == RemoteState.WAITING_FOR_QUOTA ||
+            latest.remoteState == RemoteState.RETRYABLE_ERROR
+        ) {
+            View.VISIBLE
+        } else {
+            View.GONE
+        }
+        resultLink.visibility = if (
+            latest.remoteState == RemoteState.PUBLISHED_VERIFIED && latest.githubUrl != null
+        ) {
+            View.VISIBLE
+        } else {
+            View.GONE
         }
     }
+
+    private fun processLabel(session: SessionSnapshot): String = when (session.remoteState) {
+        RemoteState.LOCAL_ONLY -> "my-data-hub  ○ ожидает передачу"
+        RemoteState.RECEIVING -> "my-data-hub  ● принимает сессию"
+        RemoteState.PROCESSING -> "Gemini Lite    ● распознаёт"
+        RemoteState.PUBLISHING -> "IdeaHub           ● commit и readback"
+        RemoteState.PUBLISHED_VERIFIED -> "IdeaHub           ✓ проверено · аудио удалено"
+        RemoteState.WAITING_FOR_QUOTA -> {
+            val retryAt = session.retryAtEpochMs
+            if (retryAt == null) {
+                "Лимит Gemini  ◌ ожидание, аудио сохранено"
+            } else {
+                "Лимит Gemini  ◌ повтор в ${formatClock(retryAt)}"
+            }
+        }
+        RemoteState.RETRYABLE_ERROR -> {
+            val error = session.lastError?.take(62).orEmpty()
+            if (error.isBlank()) "Процесс          ! данные сохранены" else "Процесс          ! $error"
+        }
+        else -> "my-data-hub  ○ ожидает"
+    }
+
+    private fun formatClock(epochMs: Long): String = Instant.ofEpochMilli(epochMs)
+        .atZone(ZoneId.systemDefault())
+        .format(DateTimeFormatter.ofPattern("HH:mm"))
 
     private fun mark(done: Boolean): String = if (done) "✓" else "●"
 
@@ -290,9 +386,21 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun retryLatest() {
+        val session = store.latestSession() ?: return
+        store.setRemoteState(
+            session.sessionId,
+            RemoteState.PROCESSING,
+            "Повтор запрошен; исходные данные сохранены",
+        )
+        SyncScheduler.enqueue(this)
+        refresh()
+    }
+
     private fun ensureReadyAnd(action: String) {
         if (!config.isConfigured()) {
-            pendingStart = action == RecordingService.ACTION_START || action == RecordingService.ACTION_RESUME
+            pendingStart = action == RecordingService.ACTION_START ||
+                action == RecordingService.ACTION_RESUME
             showSettings()
             return
         }
@@ -307,9 +415,17 @@ class MainActivity : Activity() {
         }
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_PERMISSIONS && grantResults.all { it == PackageManager.PERMISSION_GRANTED } && pendingStart) {
+        if (
+            requestCode == REQUEST_PERMISSIONS &&
+            grantResults.all { it == PackageManager.PERMISSION_GRANTED } &&
+            pendingStart
+        ) {
             pendingStart = false
             val action = if (store.activeSession()?.captureState == CaptureState.PAUSED) {
                 RecordingService.ACTION_RESUME
@@ -326,7 +442,7 @@ class MainActivity : Activity() {
             setPadding(dp(20), dp(8), dp(20), 0)
         }
         val url = EditText(this).apply {
-            hint = "https://backend.example"
+            hint = "https://devstand.example"
             setText(config.backendUrl.orEmpty())
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
         }
@@ -337,42 +453,60 @@ class MainActivity : Activity() {
         box.addView(url)
         box.addView(token)
         AlertDialog.Builder(this)
-            .setTitle("Подключение")
-            .setMessage("Ключи Gemini и GitHub остаются только на сервере.")
+            .setTitle("my-data-hub")
+            .setMessage(
+                "Телефон хранит запись и очередь. Gemini, контроль лимитов и IdeaHub " +
+                    "выполняются на devstand.",
+            )
             .setView(box)
             .setNegativeButton("Отмена", null)
             .setPositiveButton("Сохранить") { _, _ ->
                 val normalized = url.text.toString().trim().trimEnd('/')
-                if (!validBackendUrl(normalized)) {
-                    Toast.makeText(this, "Нужен HTTPS URL; HTTP разрешён только локально в debug", Toast.LENGTH_LONG).show()
+                if (!validServerUrl(normalized)) {
+                    Toast.makeText(
+                        this,
+                        "Нужен HTTPS URL; HTTP разрешён только локально в debug",
+                        Toast.LENGTH_LONG,
+                    ).show()
                     return@setPositiveButton
                 }
                 config.backendUrl = normalized
                 if (token.text.isNotBlank()) config.deviceToken = token.text.toString()
                 if (!config.isConfigured()) {
-                    Toast.makeText(this, "Укажите URL и device token", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, "Укажите URL devstand и device token", Toast.LENGTH_LONG).show()
                 } else if (pendingStart) {
                     pendingStart = false
-                    ensureReadyAnd(if (store.activeSession()?.captureState == CaptureState.PAUSED) RecordingService.ACTION_RESUME else RecordingService.ACTION_START)
+                    ensureReadyAnd(
+                        if (store.activeSession()?.captureState == CaptureState.PAUSED) {
+                            RecordingService.ACTION_RESUME
+                        } else {
+                            RecordingService.ACTION_START
+                        },
+                    )
                 }
             }
             .show()
     }
 
-    private fun validBackendUrl(value: String): Boolean {
+    private fun validServerUrl(value: String): Boolean {
         if (value.startsWith("https://")) return true
-        return BuildConfig.DEBUG && (value.startsWith("http://127.0.0.1") || value.startsWith("http://localhost"))
+        return BuildConfig.DEBUG && (
+            value.startsWith("http://127.0.0.1") ||
+                value.startsWith("http://localhost")
+            )
     }
 
     private fun consumeProvisioningIntent(intent: Intent) {
-        val backend = intent.getStringExtra(EXTRA_BACKEND_URL)
+        val server = intent.getStringExtra(EXTRA_SERVER_URL)
+            ?: intent.getStringExtra(EXTRA_BACKEND_URL)
         val token = intent.getStringExtra(EXTRA_DEVICE_TOKEN)
-        if (!backend.isNullOrBlank()) config.backendUrl = backend
+        if (!server.isNullOrBlank()) config.backendUrl = server
         if (!token.isNullOrBlank()) config.deviceToken = token
-        if (!backend.isNullOrBlank() || !token.isNullOrBlank()) {
+        if (!server.isNullOrBlank() || !token.isNullOrBlank()) {
+            intent.removeExtra(EXTRA_SERVER_URL)
             intent.removeExtra(EXTRA_BACKEND_URL)
             intent.removeExtra(EXTRA_DEVICE_TOKEN)
-            Toast.makeText(this, "Подключение настроено через ADB", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "my-data-hub настроен через ADB", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -386,6 +520,7 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQUEST_PERMISSIONS = 100
+        const val EXTRA_SERVER_URL = "server_url"
         const val EXTRA_BACKEND_URL = "backend_url"
         const val EXTRA_DEVICE_TOKEN = "device_token"
         private val BACKGROUND = 0xFF101114.toInt()
