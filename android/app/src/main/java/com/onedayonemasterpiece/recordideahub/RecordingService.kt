@@ -64,7 +64,7 @@ class RecordingService : Service() {
             } else {
                 CapturePolicy.CONTINUOUS_V1
             },
-            vadEngine = if (autoSilence) "webrtc_vad" else null,
+            vadEngine = if (autoSilence) EfficientVad.ENGINE_NAME else null,
         )
         enterForeground("Слушаю · тишина не записывается", paused = false)
         beginCapture()
@@ -148,6 +148,10 @@ class RecordingService : Service() {
 
     private fun captureLoop(id: String) {
         val initial = store.session(id) ?: return
+        val sessionStartEpochMs = runCatching {
+            OffsetDateTime.parse(initial.startedAt).toInstant().toEpochMilli()
+        }.getOrElse { System.currentTimeMillis() }
+        val manualPauseMs = initial.manualPauseMs
         val minBuffer = AudioRecord.getMinBufferSize(
             AudioProfile.SAMPLE_RATE_HZ,
             AudioFormat.CHANNEL_IN_MONO,
@@ -175,12 +179,14 @@ class RecordingService : Service() {
         }
         audioRecord = recorder
         val suppressor = if (NoiseSuppressor.isAvailable()) {
-            runCatching { NoiseSuppressor.create(recorder.audioSessionId) }.getOrNull()
+            runCatching {
+                NoiseSuppressor.create(recorder.audioSessionId)?.also { it.enabled = true }
+            }.getOrNull()
         } else {
             null
         }
         val detector = EfficientVad(initial.capturePolicy == CapturePolicy.VOICE_ACTIVITY_AUTO_PAUSE_V1)
-        val latch = SpeechLatch(attackFrames = 3, hangoverFrames = 60)
+        val latch = SpeechLatch(attackFrames = 3, hangoverFrames = HANGOVER_FRAMES)
         val preRoll = ArrayDeque<FramePacket>()
         var writer: M4aChunkWriter? = null
         var persistedAudioMs = initial.durationMs
@@ -190,6 +196,7 @@ class RecordingService : Service() {
             CaptureActivity.AUTO_SILENCE
         }
         var lastBroadcastActivity: String? = null
+        var lastRuntimeUpdateWallMs = -1L
         var lastStoreUpdateWallMs = -1L
         var silenceStartedWallMs: Long? = null
         val frame = ShortArray(EfficientVad.FRAME_SAMPLES)
@@ -200,23 +207,21 @@ class RecordingService : Service() {
             }
             while (captureRequested) {
                 if (!readFrame(recorder, frame)) continue
-                val wallEndMs = elapsedFromStart(initial.startedAt)
+                val wallEndMs = (System.currentTimeMillis() - sessionStartEpochMs).coerceAtLeast(0L)
                 val wallStartMs = (wallEndMs - EfficientVad.FRAME_MS).coerceAtLeast(0L)
-                val packet = FramePacket(frame.copyOf(), wallStartMs, wallEndMs)
                 val wasActive = latch.active
-                val active = latch.onFrame(detector.isSpeech(packet.samples))
+                val active = latch.onFrame(detector.isSpeech(frame))
                 if (active) {
                     silenceStartedWallMs = null
+                    writer = writer ?: newWriter(id, persistedAudioMs)
                     if (!wasActive) {
-                        ensurePreRoll(preRoll, packet)
-                        writer = writer ?: newWriter(id, persistedAudioMs)
+                        pushPreRoll(preRoll, frame, wallStartMs, wallEndMs)
                         while (preRoll.isNotEmpty()) {
                             val buffered = preRoll.removeFirst()
                             writer?.writeFrame(buffered.samples, buffered.wallStartMs, buffered.wallEndMs)
                         }
                     } else {
-                        writer = writer ?: newWriter(id, persistedAudioMs)
-                        writer?.writeFrame(packet.samples, packet.wallStartMs, packet.wallEndMs)
+                        writer?.writeFrame(frame, wallStartMs, wallEndMs)
                     }
                     activity = if (detector.isFailOpen) {
                         CaptureActivity.FALLBACK_CONTINUOUS
@@ -228,7 +233,7 @@ class RecordingService : Service() {
                         writer = null
                     }
                 } else {
-                    ensurePreRoll(preRoll, packet)
+                    pushPreRoll(preRoll, frame, wallStartMs, wallEndMs)
                     if (silenceStartedWallMs == null) silenceStartedWallMs = wallStartMs
                     activity = CaptureActivity.AUTO_SILENCE
                     val silenceMs = wallEndMs - (silenceStartedWallMs ?: wallEndMs)
@@ -242,34 +247,43 @@ class RecordingService : Service() {
                 }
 
                 val recordedAudioMs = persistedAudioMs + (writer?.durationMs ?: 0L)
-                val currentSession = store.session(id) ?: break
                 val autoSkipped = (
-                    wallEndMs - currentSession.manualPauseMs - recordedAudioMs
+                    wallEndMs - manualPauseMs - recordedAudioMs
                     ).coerceAtLeast(0L)
-                runtime.update(id, recordedAudioMs, wallEndMs, autoSkipped, activity)
+                val activityChanged = activity != lastBroadcastActivity
+                if (
+                    lastRuntimeUpdateWallMs < 0L ||
+                    wallEndMs - lastRuntimeUpdateWallMs >= RUNTIME_UPDATE_INTERVAL_MS ||
+                    activityChanged
+                ) {
+                    runtime.update(id, recordedAudioMs, wallEndMs, autoSkipped, activity)
+                    lastRuntimeUpdateWallMs = wallEndMs
+                }
                 if (
                     lastStoreUpdateWallMs < 0L ||
                     wallEndMs - lastStoreUpdateWallMs >= STORE_UPDATE_INTERVAL_MS ||
-                    activity != lastBroadcastActivity
+                    activityChanged
                 ) {
                     store.updateCaptureProgress(
                         id,
                         recordedAudioMs,
                         wallEndMs,
-                        currentSession.manualPauseMs,
+                        manualPauseMs,
                         autoSkipped,
                         activity,
                     )
                     lastStoreUpdateWallMs = wallEndMs
                 }
-                if (activity != lastBroadcastActivity) {
+                if (activityChanged) {
                     updateNotification(activity)
                     lastBroadcastActivity = activity
-                    broadcast(if (activity == CaptureActivity.FALLBACK_CONTINUOUS) {
-                        "Автопропуск недоступен · записываю всё"
-                    } else {
-                        null
-                    })
+                    broadcast(
+                        if (activity == CaptureActivity.FALLBACK_CONTINUOUS) {
+                            "Автопропуск недоступен · записываю всё"
+                        } else {
+                            null
+                        },
+                    )
                 }
             }
         } catch (exc: Exception) {
@@ -288,24 +302,25 @@ class RecordingService : Service() {
             persistedAudioMs = persist(writer?.close(), persistedAudioMs)
             val finalSession = store.session(id)
             if (finalSession != null) {
-                val wallElapsed = elapsedFromStart(finalSession.startedAt)
+                val wallElapsed = (System.currentTimeMillis() - sessionStartEpochMs).coerceAtLeast(0L)
                 val autoSkipped = (
                     wallElapsed - finalSession.manualPauseMs - persistedAudioMs
                     ).coerceAtLeast(0L)
+                val finalActivity = if (captureRequested) activity else CaptureActivity.IDLE
                 store.updateCaptureProgress(
                     id,
                     persistedAudioMs,
                     wallElapsed,
                     finalSession.manualPauseMs,
                     autoSkipped,
-                    if (captureRequested) activity else CaptureActivity.IDLE,
+                    finalActivity,
                 )
                 runtime.update(
                     id,
                     persistedAudioMs,
                     wallElapsed,
                     autoSkipped,
-                    if (captureRequested) activity else CaptureActivity.IDLE,
+                    finalActivity,
                 )
             }
             broadcast()
@@ -326,9 +341,19 @@ class RecordingService : Service() {
         return offset == target.size
     }
 
-    private fun ensurePreRoll(queue: ArrayDeque<FramePacket>, packet: FramePacket) {
-        queue.addLast(packet)
-        while (queue.size > PRE_ROLL_FRAMES) queue.removeFirst()
+    private fun pushPreRoll(
+        queue: ArrayDeque<FramePacket>,
+        samples: ShortArray,
+        wallStartMs: Long,
+        wallEndMs: Long,
+    ) {
+        val reusable = if (queue.size >= PRE_ROLL_FRAMES) {
+            queue.removeFirst().samples
+        } else {
+            ShortArray(samples.size)
+        }
+        samples.copyInto(reusable)
+        queue.addLast(FramePacket(reusable, wallStartMs, wallEndMs))
     }
 
     private fun newWriter(id: String, audioStartMs: Long): M4aChunkWriter = M4aChunkWriter(
@@ -474,7 +499,9 @@ class RecordingService : Service() {
         private const val CHANNEL_ID = "record-idea-hub-recording"
         private const val NOTIFICATION_ID = 7001
         private const val MIN_SESSION_MS = 5_000L
-        private const val PRE_ROLL_FRAMES = 30
+        private const val PRE_ROLL_FRAMES = 20
+        private const val HANGOVER_FRAMES = 40
+        private const val RUNTIME_UPDATE_INTERVAL_MS = 500L
         private const val STORE_UPDATE_INTERVAL_MS = 2_000L
         private const val LONG_SILENCE_CLOSE_MS = 15_000L
         private const val MIN_DURABLE_SEGMENT_MS = 10_000L
