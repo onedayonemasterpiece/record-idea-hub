@@ -1,5 +1,6 @@
 package com.onedayonemasterpiece.recordideahub
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,6 +8,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
@@ -105,19 +107,31 @@ class RecordingService : Service() {
     private fun beginCapture() {
         if (captureThread?.isAlive == true) return
         val id = sessionId ?: store.activeSession()?.sessionId ?: return
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            pauseForMicrophoneFailure(id, "Разрешение на микрофон отозвано")
+            return
+        }
         captureRequested = true
         acquireWakeLock()
         captureThread = Thread({ captureLoop(id) }, "record-idea-hub-capture").also { it.start() }
     }
 
     private fun captureLoop(id: String) {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            pauseForMicrophoneFailure(id, "Нет разрешения на запись звука")
+            return
+        }
         val minBuffer = AudioRecord.getMinBufferSize(
             WavChunkWriter.SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
         )
+        if (minBuffer <= 0) {
+            pauseForMicrophoneFailure(id, "Устройство не предоставило аудиобуфер")
+            return
+        }
         val bufferSize = maxOf(minBuffer * 2, 8192)
-        val recorder = runCatching {
+        val recorder = try {
             AudioRecord.Builder()
                 .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
                 .setAudioFormat(
@@ -129,13 +143,11 @@ class RecordingService : Service() {
                 )
                 .setBufferSizeInBytes(bufferSize)
                 .build()
-        }.getOrElse {
-            captureRequested = false
-            store.setCaptureState(id, CaptureState.PAUSED)
-            store.setLocalError(id, "Не удалось открыть микрофон: ${it.message}")
-            enterForeground("Микрофон недоступен", paused = true)
-            releaseWakeLock()
-            broadcast()
+        } catch (exc: SecurityException) {
+            pauseForMicrophoneFailure(id, "Android запретил доступ к микрофону")
+            return
+        } catch (exc: RuntimeException) {
+            pauseForMicrophoneFailure(id, "Не удалось открыть микрофон: ${exc.message}")
             return
         }
         audioRecord = recorder
@@ -144,10 +156,22 @@ class RecordingService : Service() {
         var silentMs = 0L
         var lastRuntimeUpdate = 0L
         try {
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                throw SecurityException("RECORD_AUDIO permission was revoked")
+            }
             recorder.startRecording()
+            if (recorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                throw IllegalStateException("AudioRecord did not enter recording state")
+            }
             while (captureRequested) {
                 val count = recorder.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
-                if (count <= 0) continue
+                if (count == AudioRecord.ERROR_DEAD_OBJECT) {
+                    throw IllegalStateException("Android audio service was restarted")
+                }
+                if (count < 0) {
+                    throw IllegalStateException("AudioRecord read failed: $count")
+                }
+                if (count == 0) continue
                 writer.write(buffer, count)
                 val liveDuration = writer.startMs + writer.durationMs
                 if (liveDuration - lastRuntimeUpdate >= 500L) {
@@ -164,6 +188,13 @@ class RecordingService : Service() {
                     silentMs = 0L
                 }
             }
+        } catch (exc: SecurityException) {
+            if (captureRequested) {
+                captureRequested = false
+                store.setCaptureState(id, CaptureState.PAUSED)
+                store.setLocalError(id, "Доступ к микрофону отозван; сохранён записанный фрагмент")
+                enterForeground("Нужно разрешение на микрофон", paused = true)
+            }
         } catch (exc: Exception) {
             if (captureRequested) {
                 captureRequested = false
@@ -179,6 +210,15 @@ class RecordingService : Service() {
             releaseWakeLock()
             broadcast()
         }
+    }
+
+    private fun pauseForMicrophoneFailure(id: String, message: String) {
+        captureRequested = false
+        store.setCaptureState(id, CaptureState.PAUSED)
+        store.setLocalError(id, message)
+        enterForeground("Микрофон недоступен", paused = true)
+        releaseWakeLock()
+        broadcast(message)
     }
 
     private fun newWriter(id: String): WavChunkWriter {
@@ -218,7 +258,10 @@ class RecordingService : Service() {
         var samples = 0
         var index = 0
         while (index + 1 < count) {
-            val sample = ((buffer[index + 1].toInt() shl 8) or (buffer[index].toInt() and 0xff)).toShort().toInt()
+            val sample = (
+                (buffer[index + 1].toInt() shl 8) or
+                    (buffer[index].toInt() and 0xff)
+                ).toShort().toInt()
             sum += sample.toDouble() * sample.toDouble()
             samples++
             index += 2
@@ -239,6 +282,7 @@ class RecordingService : Service() {
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun notification(text: String, paused: Boolean): Notification {
         val toggleAction = if (paused) ACTION_RESUME else ACTION_PAUSE
         val toggleLabel = if (paused) "Продолжить" else "Пауза"
