@@ -77,6 +77,11 @@ class SyncWorker(
         // Required on every pass. This repairs the server-restart defect found in the v1 client:
         // a local session is not proof that the server still has its durable terminology identity.
         val initialized = api.createSession(original)
+        store.reconcileV2ServerState(
+            original.sessionId,
+            initialized.chunksUploaded,
+            initialized.recordingFinished,
+        )
         store.markServerInitialized(original.sessionId)
         store.updateRemoteProgress(original.sessionId, initialized)
         if (initialized.isVerifiedAndPurged()) {
