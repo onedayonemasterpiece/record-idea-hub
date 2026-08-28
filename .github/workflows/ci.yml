@@ -1,4 +1,4 @@
-name: CI and APK
+name: Android CI and APK
 
 on:
   push:
@@ -19,30 +19,10 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-  backend:
-    name: Backend tests and container
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: backend/pyproject.toml
-      - name: Install backend
-        run: python -m pip install --upgrade pip && python -m pip install -e './backend[dev]'
-      - name: Lint
-        run: ruff check --config backend/pyproject.toml backend
-      - name: Test
-        run: python -m pytest -q backend
-      - name: Build production container
-        run: docker build --build-arg EVENTS_BOT_REF=8710e56fa3685f6c30a90cd062d532dce0348cce backend
-
   android:
-    name: Android unit tests and debug APK
+    name: Android checks and installable debug APK
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-java@v5
@@ -65,8 +45,10 @@ jobs:
         with:
           gradle-version: "8.13"
           cache-disabled: true
-      - name: Test and assemble
-        run: gradle -p android --no-daemon --stacktrace testDebugUnitTest assembleDebug
+      - name: Lint, test and assemble
+        run: >-
+          gradle -p android --no-daemon --stacktrace
+          lintDebug testDebugUnitTest assembleDebug
       - name: Upload installable debug APK
         uses: actions/upload-artifact@v7
         with:
