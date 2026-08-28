@@ -1,114 +1,146 @@
-# my-data-hub integration
+# my-data-hub Voice Intake integration
 
 ## Purpose
 
-`record-idea-hub` is a local Android client. The existing `my-data-hub` control-plane on devstand provides the only server boundary for Google API traffic and IdeaHub publication.
+`record-idea-hub` is a local-first Android client. The existing `my-data-hub` control-plane on devstand is the only server boundary for Google API traffic, temporary processing storage and IdeaHub publication.
 
-The server implementation lives in:
-
-```text
-src/my_data_hub/voice_intake/
-```
-
-Its operational runbook lives in the my-data-hub repository:
+Current public origin:
 
 ```text
-docs/operations/record-idea-hub-voice-intake.md
+https://mcp-datahub.kenigevents.ru
 ```
 
-## API root
+Android 1.1 API root:
 
 ```text
-/voice-intake/v1
+/voice-intake/v2
 ```
 
-All requests require one high-entropy device credential:
+The authoritative detailed contract is maintained in `my-data-hub`:
+
+```text
+docs/handoffs/record-idea-hub-android-1.1-api-contract.md
+docs/operations/record-idea-hub-voice-intake-v2.md
+```
+
+The legacy `/voice-intake/v1` path remains available only for unfinished Android 1.0 WAV sessions.
+
+## Authentication
+
+Every request requires one high-entropy device credential:
 
 ```http
 Authorization: Bearer <device token>
 ```
 
-The token identifies the single owner device; it is not a Google, Supabase or GitHub credential.
+The token identifies the single owner device. It is not a Google, Supabase or GitHub credential.
 
-## Operations
+## API v2
 
-### Open/validate a client-owned session
+### Capabilities
 
 ```http
-POST /voice-intake/v1/sessions
+GET /voice-intake/v2/capabilities
+```
+
+Returns the accepted AAC-LC/M4A profile, safety bounds and the expected two-request processing path. It performs no Google request.
+
+### Create or re-open a durable session
+
+```http
+POST /voice-intake/v2/sessions
 Content-Type: application/json
 ```
 
-The server validates identity and metadata but does not create a durable server-side session record.
+Create is idempotent and survives process/container restart. Every Android synchronization pass repeats it before upload. Immutable metadata includes session identity, capture policy, audio profile and optional VAD provenance.
 
-### Transcribe one WAV chunk
+### Upload one independent M4A segment
 
 ```http
-PUT /voice-intake/v1/sessions/{session_id}/chunks/{chunk_index}
-Content-Type: audio/wav
+PUT /voice-intake/v2/sessions/{session_id}/chunks/{chunk_index}
+Content-Type: audio/mp4
 X-Chunk-SHA256: <64 lowercase hex>
 X-Chunk-Duration-Ms: <positive integer>
+X-Audio-Start-Ms: <compacted audio timeline>
+X-Audio-End-Ms: <compacted audio timeline>
+X-Wall-Start-Ms: <session wall timeline>
+X-Wall-End-Ms: <session wall timeline>
 ```
 
-The response contains the validated transcript object, model, usage and non-secret limiter evidence. Android stores the transcript in its local SQLite transaction before considering the chunk complete.
+The server validates body bounds, SHA-256, MP4 container, AAC-LC codec, 16 kHz mono profile and duration before issuing a durable receipt. Uploads, including duplicate uploads, make zero Gemini calls and return no synthetic transcript.
 
-### Complete and publish
+### Complete the logical recording
 
 ```http
-POST /voice-intake/v1/sessions/{session_id}/complete
+POST /voice-intake/v2/sessions/{session_id}/complete
 Content-Type: application/json
 ```
 
-The body contains session metadata plus the complete ordered list of locally persisted transcript objects. The server performs one structured Flash-Lite synthesis and one atomic IdeaHub transaction.
+The exact manifest contains all contiguous segment indices, hashes and audio/wall timelines. The server durably closes the session and queues asynchronous processing before returning `202`.
 
-### Reconcile publication
+### Read durable progress
 
 ```http
-GET /voice-intake/v1/sessions/{session_id}
+GET /voice-intake/v2/sessions/{session_id}
 ```
 
-Android calls this before repeating completion after an uncertain network outcome. The status is derived from deterministic paths in `idea-hub/main`, not from volatile server memory.
+Relevant states:
 
-## Retry contract
-
-A retryable failure uses a typed detail object:
-
-```json
-{
-  "detail": {
-    "code": "quota_exhausted_rpm",
-    "retryable": true,
-    "retry_after_seconds": 42,
-    "reconciliation_required": false
-  }
-}
+```text
+receiving
+queued
+normalizing
+transcribing
+summarizing
+publishing
+verifying
+waiting_quota
+retryable_error
+reconciliation_required
+published_verified
 ```
 
-Android converts quota errors to `WAITING_FOR_QUOTA`, shows the concrete retry time and schedules WorkManager. It never deletes or re-records source audio because of a server failure.
+Only this conjunction is terminal success:
+
+```text
+state=published_verified
+github_verified=true
+server_audio_purged=true
+```
+
+## Processing contract
+
+For the priority review scenario up to roughly 20 minutes:
+
+1. create and all uploads: zero Gemini requests;
+2. aggregate transcription: one Gemini Flash-Lite request;
+3. structured detailed summary: one Gemini Flash-Lite request;
+4. GitHub publication/readback/purge: zero Gemini requests.
+
+A summary retry does not repeat a durable transcription. A GitHub retry does not repeat either Gemini stage.
+
+## Retry and reconciliation
+
+- Create, upload and an identical complete manifest are idempotent.
+- Quota denial before send enters `waiting_quota` with an authoritative retry time.
+- A known safe pre-send failure may be retried.
+- A provider request whose outcome is ambiguous after send enters `reconciliation_required`; Android must not silently replay it.
+- Local audio is retained through every non-terminal state.
 
 ## Secret boundary
 
-Only the devstand process receives:
+Only devstand receives:
 
-- Google API key pool;
-- dedicated shared-limiter Supabase URL and service key;
-- GitHub token with access to `onedayonemasterpiece/idea-hub`;
-- the one-device bearer token.
+- the configured Google key pool;
+- dedicated shared-limiter Supabase credentials;
+- the bounded GitHub credential for `onedayonemasterpiece/idea-hub`;
+- the device bearer token.
 
 The APK receives only:
 
-- the public HTTPS devstand URL;
-- the one-device bearer token.
+- the public HTTPS origin;
+- the device bearer token, stored through Android Keystore-backed encryption.
 
-The existing host `gh` authorization is used during devstand provisioning to obtain a private runtime token. The Android application neither invokes GitHub directly nor stores a GitHub credential.
+## Server storage boundary
 
-## Non-goals
-
-This integration does not introduce:
-
-- a separate Fly application;
-- another server database;
-- Redis or a message broker;
-- server-side audio storage;
-- an MCP call in the recording hot path;
-- multiple users or device synchronization.
+Unlike v1, v2 temporarily persists uploaded M4A segments and normalized audio in a private spool so processing can continue independently of the phone. Audio is never committed to GitHub and is deleted immediately after successful IdeaHub exact/current-main readback. Small non-audio receipts may remain for reconciliation.

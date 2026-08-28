@@ -1,211 +1,162 @@
-# OpenCode ADB handoff
+# OpenCode / ADB maintenance handoff
 
-Цель: установить уже собранный APK на Samsung S21 Ultra, привязать его к существующему `my-data-hub` devstand и подтвердить путь:
+The initial Samsung S21 Ultra acceptance is complete. Use this document for reinstalling a later build, reproducing a confirmed defect or validating a focused follow-up change. Do not remove the working Android 1.0 package unless explicitly requested.
 
-```text
-голос -> локальные WAV/SQLite -> my-data-hub -> shared limiter -> Gemini Flash-Lite
-      -> idea-hub/main readback -> локальное удаление WAV
-```
-
-OpenCode не реализует интерфейс и бизнес-логику. Любой кодовый дефект фиксируется только после воспроизводимого аппаратного наблюдения и отдельного commit в `record-idea-hub`.
-
-## Входы
-
-Получить вне GitHub и не печатать в итоговой диагностике:
+## Current packages
 
 ```text
-SERVER_URL=https://<devstand public host>
-DEVICE_TOKEN=<single-device bearer token>
+Android 1.0:
+com.onedayonemasterpiece.recordideahub
+
+Android 1.1 side-by-side build:
+com.onedayonemasterpiece.recordideahub.v11
 ```
 
-На телефон не передаются Google API key, Supabase service key или GitHub token.
+## Obtain the APK
 
-## Получение APK
+Use the latest successful `Android CI and APK` run on `main`. The current workflow artifact is:
 
-Использовать artifact `record-idea-hub-debug-apk` из последнего зелёного workflow `Android CI and APK` на `main` либо из явно указанного проверяемого feature commit.
+```text
+record-idea-hub-1.1-rc2-apk
+```
 
-Пример через GitHub CLI:
+Example:
 
 ```bash
 REPO=onedayonemasterpiece/record-idea-hub
-RUN_ID="$(gh run list -R "$REPO" --workflow ci.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
-test -n "$RUN_ID"
+RUN_ID="$(gh run list -R "$REPO" --workflow ci.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
 rm -rf .tmp-record-idea-apk
 mkdir -p .tmp-record-idea-apk
-gh run download -R "$REPO" "$RUN_ID" -n record-idea-hub-debug-apk -D .tmp-record-idea-apk
+gh run download -R "$REPO" "$RUN_ID" -n record-idea-hub-1.1-rc2-apk -D .tmp-record-idea-apk
 APK="$(find .tmp-record-idea-apk -name '*.apk' -type f -print -quit)"
 test -f "$APK"
 sha256sum "$APK"
 ```
 
-Зафиксировать run ID, head SHA, artifact ID/name и APK SHA-256.
+Record run ID, head SHA, artifact ID/name and APK SHA-256. Do not substitute a local build for final evidence.
 
-## Проверка devstand до установки
-
-Не включать shell tracing (`set -x`) и не выводить `DEVICE_TOKEN`:
-
-```bash
-set +x
-curl --fail --silent --show-error \
-  -H "Authorization: Bearer $DEVICE_TOKEN" \
-  "$SERVER_URL/voice-intake/v1/health"
-```
-
-Ожидается JSON `status=ready`, модель Flash-Lite и `server_audio_persistence=false`.
-
-## Установка
+## Install side by side
 
 ```bash
 adb devices -l
 adb install -r "$APK"
-adb shell pm grant \
-  com.onedayonemasterpiece.recordideahub \
-  android.permission.RECORD_AUDIO
 ```
 
-Для Android 13+:
+If only the previous 1.1 debug signature conflicts, remove exactly this package and reinstall:
 
 ```bash
-adb shell pm grant \
-  com.onedayonemasterpiece.recordideahub \
-  android.permission.POST_NOTIFICATIONS || true
+adb uninstall com.onedayonemasterpiece.recordideahub.v11
+adb install "$APK"
 ```
 
-## Привязка приложения
+Never remove `com.onedayonemasterpiece.recordideahub` as part of 1.1 maintenance.
 
-Приложение принимает только URL devstand и device token. Перед запуском выключить shell tracing и не копировать команду с подставленным секретом в отчёт:
+Grant permissions:
+
+```bash
+PKG=com.onedayonemasterpiece.recordideahub.v11
+adb shell pm grant "$PKG" android.permission.RECORD_AUDIO
+adb shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS || true
+```
+
+## Provisioning
+
+Inputs are private and must not be printed in logs or reports:
+
+```text
+SERVER_URL=https://mcp-datahub.kenigevents.ru
+DEVICE_TOKEN=<single-device bearer token>
+```
+
+Debug provisioning:
 
 ```bash
 set +x
 adb shell am start \
-  -n com.onedayonemasterpiece.recordideahub/.MainActivity \
+  -n com.onedayonemasterpiece.recordideahub.v11/com.onedayonemasterpiece.recordideahub.MainActivity \
   --es server_url "$SERVER_URL" \
   --es device_token "$DEVICE_TOKEN"
 unset DEVICE_TOKEN
 ```
 
-Приложение сохраняет token в encrypted preferences, ключ шифрования создаётся Android Keystore. После provisioning в UI должно появиться короткое подтверждение `my-data-hub настроен через ADB`.
+The application stores the token through Android Keystore-backed encryption. Google, Supabase and GitHub credentials never go to the phone.
 
-Для локальной debug-проверки без публичного reverse proxy допустим только debug APK:
+## Focused smoke test
 
-```bash
-adb reverse tcp:8080 tcp:8080
-SERVER_URL=http://127.0.0.1:8080
+1. Start recording.
+2. Observe automatic-silence state during quiet input: microphone remains active, saved-audio timer is stopped.
+3. Speak a short control sentence.
+4. Use manual pause: microphone must stop.
+5. Resume, speak another sentence and finish.
+6. Confirm local files are AAC-LC/M4A, mono 16 kHz.
+7. Observe `/voice-intake/v2` progress through upload, transcription, summary, publication and readback.
+8. Terminal status must be:
+
+```text
+published_verified
+github_verified=true
+server_audio_purged=true
 ```
 
-Production acceptance проводится только через HTTPS URL devstand.
+9. Confirm local M4A files are deleted only after that terminal state.
 
-## Базовый end-to-end сценарий
+## Binary-safe M4A extraction
 
-1. Нажать `Записать` и говорить 20–30 секунд.
-2. Нажать `Пауза`.
-3. Убедиться, что интерфейс показывает одну и ту же сессию и локально сохранённый чанк.
-4. Нажать `Продолжить`, записать ещё 20–30 секунд.
-5. Нажать `Завершить и отправить`.
-6. Наблюдать стадии без перезапуска записи:
-   - `Передача`;
-   - `Gemini Lite распознаёт`;
-   - `IdeaHub commit и readback`;
-   - `IdeaHub проверено · аудио удалено`.
-7. Открыть ссылку IdeaHub и проверить:
-   - один neutral commit;
-   - один `inbox/voice/.../<session_id>.md`;
-   - один `registry/sessions/.../<session_id>.md`;
-   - одну открытую entry в `registry/intake-sessions.yaml`;
-   - одна пользовательская сессия, а не отдельный Markdown на каждый чанк.
+Use `exec-out` with a binary-safe host process, not a text shell redirect:
 
-## Обязательные аппаратные сценарии
+```python
+import subprocess
+from pathlib import Path
 
-### Паузы и одна логическая сессия
+adb = r"<absolute adb path>"
+pkg = "com.onedayonemasterpiece.recordideahub.v11"
+remote = "files/audio/<actual-file>.m4a"
+local = Path(r"<evidence-directory>/sample.m4a")
 
-Сделать не менее пяти коротких pause/resume. После завершения должен появиться один Markdown и один `session_id`.
-
-### Экран выключен
-
-Записывать не менее десяти минут с выключенным экраном. Foreground notification должна оставаться доступной, таймлайн после возврата — соответствовать фактической записи.
-
-### Потеря сети
-
-1. Начать запись при работающей сети.
-2. Отключить Wi-Fi и мобильные данные.
-3. Поставить на паузу, продолжить и завершить сессию.
-4. Убедиться, что UI прямо сообщает о сохранённых исходных данных.
-5. Вернуть сеть.
-6. Проверить автоматическое продолжение без новой записи и без потери чанков.
-
-### Переключение сети
-
-Во время обработки переключить Wi-Fi на мобильную сеть и обратно. Не должно появиться два IdeaHub commit для одной сессии.
-
-### UI recreation
-
-Во время записи нажать Home и удалить карточку Activity из Recent Apps, но не выполнять `am force-stop`. Foreground recording service должен сохранить запись. Повторное открытие приложения должно показать текущую сессию.
-
-### Перезапуск после закрытого чанка
-
-После паузы выгрузить UI и открыть приложение снова. Сессия должна восстановиться в паузе, закрытый WAV и локальный ledger — остаться доступными.
-
-### Quota wait
-
-При реальном 429/limiter denial интерфейс должен показать `Лимит Gemini`, конкретное время повтора и кнопку `Повторить сейчас`. До успешного повтора WAV не удаляются. Не создавать искусственный quota incident без согласования с devstand Codex.
-
-### Очистка после readback
-
-После статуса `IdeaHub проверено`:
-
-```bash
-adb shell run-as com.onedayonemasterpiece.recordideahub \
-  sh -c 'find files/audio -type f 2>/dev/null | wc -l'
+with local.open("wb") as output:
+    subprocess.run(
+        [adb, "exec-out", "run-as", pkg, "cat", remote],
+        stdout=output,
+        check=True,
+    )
 ```
 
-Для подтверждённых сессий ожидается отсутствие WAV. SQLite и маленькие transcript/receipt записи могут сохраняться как локальная история.
+Validate with `ffprobe`: MP4/M4A container, AAC-LC, 16 kHz, mono and approximately 32 kbit/s.
 
-## Диагностика
+## Diagnostics
 
-Очистить старые логи перед воспроизведением:
+Before reproduction:
 
 ```bash
 adb logcat -c
-PID="$(adb shell pidof -s com.onedayonemasterpiece.recordideahub)"
-test -n "$PID"
+PID="$(adb shell pidof -s com.onedayonemasterpiece.recordideahub.v11)"
 adb logcat --pid="$PID"
 ```
 
-Дополнительные команды:
+Useful evidence:
 
 ```bash
-adb shell dumpsys activity services com.onedayonemasterpiece.recordideahub
-adb shell dumpsys jobscheduler | grep -A30 recordideahub
-adb shell run-as com.onedayonemasterpiece.recordideahub \
-  sh -c 'find files/audio -maxdepth 3 -type f -printf "%p %s bytes\n" 2>/dev/null'
-adb shell run-as com.onedayonemasterpiece.recordideahub \
-  ls -l databases shared_prefs files/audio
+adb shell dumpsys activity services com.onedayonemasterpiece.recordideahub.v11
+adb shell dumpsys thermalservice
+adb shell run-as com.onedayonemasterpiece.recordideahub.v11 ls -la files/audio databases shared_prefs
 ```
 
-В отчёте фиксировать:
+Record:
 
-- точное время и действие;
-- состояние четырёх строк UI;
+- exact app/main commit and APK SHA;
+- device model, Android/One UI and build fingerprint;
 - `session_id`;
-- наличие и размер локального WAV;
-- HTTP status и безопасный error code;
-- GitHub commit SHA и source path;
-- был ли WAV удалён только после readback.
+- state transition where the defect occurred;
+- safe typed backend error/status;
+- M4A metadata and file size;
+- IdeaHub commit/source path;
+- whether server/local purge occurred.
 
-Не включать device token, Google/Supabase/GitHub keys, аудиобайты или полный текст личной расшифровки.
+Never include device token, provider keys, audio bytes or full personal transcript in diagnostic reports.
 
-## Samsung-specific проверка
+## Known non-blocking observations
 
-Сначала тестировать со штатными настройками батареи. Только если One UI фактически останавливает длительную запись, установить для приложения режим батареи `Без ограничений` и повторить тот же сценарий. Это фиксируется как эксплуатационное требование с доказательством, а не применяется заранее.
+- A warm marker on the adaptive icon may be partially clipped by one OEM launcher mask.
+- Samsung may log `MPEG4Writer: Stop() called but track is not started or stopped` without crash or invalid M4A.
 
-## Результат handoff
-
-Вернуть владельцу:
-
-- APK artifact/run/head SHA;
-- модель телефона и Android/One UI version;
-- PASS/FAIL по каждому сценарию;
-- IdeaHub commit/source path тестовой сессии;
-- подтверждение post-readback cleanup;
-- минимальный logcat-фрагмент только при дефекте;
-- точный commit исправления, если аппаратная отладка потребовала кодовой правки.
+Do not reopen the implementation batch for these alone. Create a focused follow-up only when the visual polish is prioritized or the media warning correlates with an actual corrupt/lost segment.

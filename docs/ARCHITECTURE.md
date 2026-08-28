@@ -1,70 +1,83 @@
-# MVP architecture
+# Android 1.1 architecture
 
 ## Product boundary
 
-One deliberately finished recording session produces exactly one IdeaHub source packet. Pause/resume events and technical chunk boundaries never create separate Markdown records.
+One deliberately completed recording session produces exactly one IdeaHub intake record. Manual pauses, automatic silence intervals and technical transport segments never create separate Markdown records.
 
 ```text
 Samsung Android
-  ├─ AudioRecord foreground service
-  ├─ recoverable PCM16/WAV chunks
-  ├─ SQLite: session, chunk and transcript state
-  └─ WorkManager: network and quota retries
+  ├─ AudioRecord foreground microphone service
+  ├─ adaptive energy gate + native fixed-point WebRTC VAD
+  ├─ hardware-preferred AAC-LC/M4A, mono 16 kHz, 32 kbit/s
+  ├─ SQLite WAL: session, segment, receipt and retry state
+  └─ WorkManager: network-constrained create/upload/complete/status
           │ HTTPS + one device token
           ▼
 existing my-data-hub control-plane on devstand
-  ├─ validates WAV, SHA-256 and request bounds
-  ├─ shared Supabase limiter
-  │    └─ reserve -> mark_sent -> one Google POST -> finalize
-  ├─ Gemini Flash-Lite chunk transcription
-  ├─ Gemini Flash-Lite structured session synthesis
-  └─ atomic Git Data API transaction + readback
+  ├─ durable idempotent session and segment receipts
+  ├─ private temporary spool
+  ├─ shared Supabase Google AI limiter
+  │    └─ preflight → reserve → selected quota scope/key → mark_sent → POST → finalize
+  ├─ one aggregate Gemini Flash-Lite transcription
+  ├─ one text-only Gemini Flash-Lite structured synthesis
+  └─ atomic IdeaHub transaction + exact/current-main readback
           │
           ▼
 idea-hub/main
   ├─ inbox/voice/YYYY/MM/<session_id>.md
   ├─ registry/sessions/YYYY/MM/<session_id>.md
-  └─ registry/intake-sessions.yaml (overall=open, pending=1)
+  ├─ registry/intake-sessions.yaml
+  └─ inbox/voice/README.md chronological index
 ```
 
 ## Ownership
 
 The phone is the durable owner of:
 
-- recording and pause/resume state;
-- WAV chunks;
-- per-chunk transcripts returned by the server;
-- retry schedule and quota-wait state;
-- the decision to delete audio after verified publication.
+- active recording and manual pause/resume state;
+- compact M4A transport segments;
+- segment SHA-256 and local receipt state;
+- retry schedule and server progress;
+- the decision to delete local audio only after verified server completion.
 
-`my-data-hub` is a bounded processing boundary. It does not persist audio, does not introduce a second session database and does not own a queue. Request bytes live only during the HTTP handler.
+`my-data-hub` durably owns the processing receipt and temporary server copy after upload. It may continue Gemini and GitHub work after the Android UI closes or the phone disconnects. Server audio is deleted only after IdeaHub exact-commit and current-main readback.
 
 ## Recording semantics
 
-- PCM 16-bit, 16 kHz, mono, WAV.
-- A chunk closes around two minutes of recorded audio or when a useful fragment is closed by an explicit pause.
-- Resume continues the same `session_id` and timeline.
-- Only “Завершить и отправить” closes the logical session.
-- Sessions shorter than five seconds are discarded locally and do not create IdeaHub noise.
-- A closed `.wav.part` is repaired and registered after process restart.
+- Input: PCM16, 16 kHz, mono through `AudioRecord`.
+- Output: AAC-LC in independently playable M4A containers, target 32 kbit/s.
+- Automatic silence keeps the microphone active but stops encoder/file output.
+- Manual pause stops the microphone.
+- Detector: conservative energy gate followed by lightweight native WebRTC VAD; any detector failure is fail-open continuous recording.
+- A RAM pre-roll and speech hangover protect phrase boundaries.
+- A durable segment normally closes around three minutes of actually recorded audio, at manual pause or at explicit finish.
+- Only `Завершить и отправить` closes the logical session.
+- Sessions shorter than the local minimum are discarded without creating IdeaHub noise.
 
-## Google and quota contract
+## Synchronization semantics
 
-Only explicitly allowed Gemini Flash-Lite model IDs may be used. A provider request is impossible unless the shared limiter has returned a valid lease. There is no process-local limiter, fail-open path, unaccounted key rotation or hidden post-send retry.
+Every v2 worker pass starts with an idempotent `POST /voice-intake/v2/sessions`. A local session is never treated as proof that the server has durable initialization state.
 
-A quota refusal is returned as typed HTTP 429 with `retry_after_seconds`. Android records `WAITING_FOR_QUOTA`, keeps all source data and schedules a delayed WorkManager run.
+Uploads create receipts and make zero Gemini calls. After the exact complete manifest is accepted, the server performs asynchronous whole-session processing. For the priority review scenario up to roughly 20 minutes:
 
-## GitHub contract
+```text
+1 aggregate audio transcription
++ 1 structured text synthesis
+= 2 physical Gemini requests
+```
 
-The server receives validated structured data, not arbitrary repository paths or arbitrary Markdown. It is hard-bound to `onedayonemasterpiece/idea-hub` and branch `main`.
+Polling is sparse and persisted. Quota wait uses the server-provided `retry_at`; ambiguous post-send outcomes enter `reconciliation_required` and are never silently replayed.
 
-Publication uses the current `main` tree as a base, creates one non-force commit, retries ordinary branch movement and reconciles an unknown network outcome by deterministic `session_id`. The phone receives success only after exact-commit and current-main readback.
+## Google quota and key contract
+
+Only explicitly allowed Gemini Flash-Lite models are accepted. The shared limiter selects from configured candidate keys by independent `quota_scope`; sibling keys from the same Google project are not treated as extra quota. Provider calls are impossible without a valid lease, and there is no direct-key fallback or hidden post-send retry.
 
 ## Failure invariant
 
-At every moment one of these states is true:
+At every moment one of these is true:
 
-1. the source WAV and all completed transcripts still exist on the phone and processing can resume; or
-2. the exact IdeaHub publication has been read back and local WAV files may be deleted.
+1. the local M4A source remains on the phone and synchronization can resume;
+2. the server has a durable copy/receipt and can finish processing without the phone;
+3. IdeaHub publication has passed exact/current-main readback, server audio is purged, and Android may delete its local segments.
 
-A generic spinner, HTTP timeout or process restart is never treated as proof of success.
+A spinner, network timeout, local upload flag or provider response alone is never proof of terminal success.

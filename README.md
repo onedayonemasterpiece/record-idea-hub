@@ -1,44 +1,84 @@
 # Record Idea Hub
 
-Однокнопочный Android-inbox для голосовых идей и review-сессий с надёжной доставкой в [`onedayonemasterpiece/idea-hub`](https://github.com/onedayonemasterpiece/idea-hub).
+Однокнопочный Android-inbox для голосовых идей и review-сессий с надёжной публикацией в [`onedayonemasterpiece/idea-hub`](https://github.com/onedayonemasterpiece/idea-hub).
 
-## Продуктовый сценарий
+## Текущий рабочий контур
+
+```text
+Android 1.1
+  ├─ локальная запись AAC-LC/M4A, mono 16 kHz, 32 kbit/s
+  ├─ ручная пауза и автоматический пропуск длительной тишины
+  ├─ SQLite + WorkManager + локальные durable-сегменты
+  └─ HTTPS /voice-intake/v2
+          │
+          ▼
+my-data-hub на devstand
+  ├─ durable receipts и временный spool
+  ├─ shared Google AI limiter и quota-aware key selection
+  ├─ 1 Gemini Flash-Lite запрос на полную транскрипцию
+  ├─ 1 Gemini Flash-Lite запрос на подробную выжимку
+  └─ atomic IdeaHub commit + exact/current-main readback
+          │
+          ▼
+idea-hub/main
+```
+
+Для типичного review продолжительностью до примерно 20 минут количество технических аудиосегментов и пауз не увеличивает число вызовов Gemini: штатный успешный путь использует ровно два `generateContent` запроса.
+
+## Пользовательский сценарий
 
 1. Нажать большую кнопку и начать запись.
-2. Поставить запись на паузу и продолжить ту же логическую сессию любое число раз.
-3. Закрытые WAV-чанки остаются на телефоне и последовательно отправляются в `my-data-hub` на devstand.
-4. `my-data-hub` проводит каждый запрос Gemini Flash-Lite через общий онлайн-limiter и возвращает структурированную расшифровку.
-5. Телефон сохраняет расшифровку локально. После явного завершения `my-data-hub` делает одну подробную выжимку и один атомарный commit в `idea-hub/main`.
-6. Успех показывается только после GitHub readback. Затем приложение удаляет локальные WAV-чанки.
+2. При необходимости использовать ручную паузу; автоматический режим сам не сохраняет длительную тишину и неречевой шум.
+3. Нажать `Завершить и отправить`.
+4. Дождаться стадий `Передача → Расшифровка → Выжимка → IdeaHub readback`.
+5. Локальное аудио удаляется только после `published_verified`, подтверждённого GitHub readback и серверного purge.
 
-Технические чанки и паузы не создают отдельные Markdown-файлы: одна завершённая пользовательская сессия всегда даёт одну новую pending-запись IdeaHub.
+Одна логическая сессия всегда создаёт одну открытую pending-запись IdeaHub. Паузы и транспортные сегменты не создают отдельные Markdown-файлы.
 
 ## Граница компонентов
 
-- `android/` — запись, foreground service, пауза/продолжение, SQLite, WorkManager, локальные транскрипции, retry и лаконичный прогресс.
-- `my-data-hub` — существующий devstand control-plane: прокси Gemini Lite, общий limiter, итоговый synthesis, GitHub transaction и readback.
-- `idea-hub` — каноническое хранилище необработанной записи и authoritative intake registry.
+- `android/` — AudioRecord, лёгкий WebRTC VAD, AAC/M4A, foreground service, SQLite, WorkManager, UI и локальная надёжность.
+- `my-data-hub` — существующий control-plane: приём сегментов, общий limiter, Gemini Lite, временный spool, IdeaHub transaction и readback.
+- `idea-hub` — каноническая необработанная запись и authoritative intake registry.
 
-В этом репозитории нет отдельного backend, Fly-приложения, серверной БД или очереди. Ключи Google, Supabase limiter и GitHub никогда не попадают в APK.
+В APK нет Google, Supabase или GitHub credentials. Телефон получает только публичный HTTPS origin devstand и один device bearer token.
 
-## Сборка Android
+## Совместимость
 
-GitHub Actions выполняет lint, unit tests и сборку installable debug APK. Artifact называется:
+- Android 1.1 использует `/voice-intake/v2`.
+- Незавершённые локальные сессии Android 1.0 могут быть допубликованы через сохранённый `/voice-intake/v1` compatibility path.
+- Текущий физически проверенный side-by-side package: `com.onedayonemasterpiece.recordideahub.v11`.
+
+## Сборка
+
+GitHub Actions выполняет:
 
 ```text
-record-idea-hub-debug-apk
+lintDebug
+testDebugUnitTest
+assembleDebug
 ```
 
-Локальный эквивалент при установленном Gradle 8.13 и Android SDK 36:
+Текущий artifact workflow:
+
+```text
+record-idea-hub-1.1-rc2-apk
+```
+
+Локальный эквивалент при Gradle 8.13 и Android SDK 36:
 
 ```bash
 gradle -p android --no-daemon lintDebug testDebugUnitTest assembleDebug
 ```
 
-## Эксплуатационные документы
+## Статус
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — продуктовая и техническая граница.
-- [`docs/MY_DATA_HUB_INTEGRATION.md`](docs/MY_DATA_HUB_INTEGRATION.md) — серверный контракт devstand.
-- [`docs/IDEA_HUB_CONTRACT.md`](docs/IDEA_HUB_CONTRACT.md) — атомарная регистрация новой записи.
-- [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) — критерии готовности.
-- [`docs/ADB_HANDOFF.md`](docs/ADB_HANDOFF.md) — установка и физическая проверка Samsung S21 Ultra через OpenCode.
+Рабочий цикл Android 1.1 принят на Samsung S21 Ultra и слит в `main`. Зафиксированные неблокирующие наблюдения — частичное обрезание оранжевого маркера одной OEM-маской launcher и нефатальное сообщение Samsung `MPEG4Writer` при валидном M4A — отложены до отдельной будущей доработки, если она понадобится.
+
+## Документация
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — текущая архитектура и инварианты.
+- [`docs/MY_DATA_HUB_INTEGRATION.md`](docs/MY_DATA_HUB_INTEGRATION.md) — API v2 и серверная граница.
+- [`docs/IDEA_HUB_CONTRACT.md`](docs/IDEA_HUB_CONTRACT.md) — атомарная регистрация записи.
+- [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) — принятые gates и текущий статус.
+- [`docs/ADB_HANDOFF.md`](docs/ADB_HANDOFF.md) — установка и диагностика следующей сборки.
