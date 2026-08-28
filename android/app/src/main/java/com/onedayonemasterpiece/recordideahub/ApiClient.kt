@@ -107,7 +107,9 @@ class ApiClientV2(baseUrl: String, token: String) {
                     .put("config_version", EfficientVad.CONFIG_VERSION),
             )
         }
-        return http.jsonRequest("POST", "$API_ROOT/sessions", body.toBytes()).toProgressV2()
+        return http.jsonRequest("POST", "$API_ROOT/sessions", body.toBytes())
+            .requireV2Session(session.sessionId)
+            .toProgressV2()
     }
 
     fun uploadChunk(chunk: ChunkRecord): ChunkUploadReceipt {
@@ -123,10 +125,16 @@ class ApiClientV2(baseUrl: String, token: String) {
                 "X-Wall-Start-Ms" to chunk.wallStartMs.toString(),
                 "X-Wall-End-Ms" to chunk.wallEndMs.toString(),
             ),
-        )
+        ).requireV2Session(chunk.sessionId)
+        val receiptMatches =
+            response.optBoolean("accepted", false) &&
+                response.optInt("chunk_index", -1) == chunk.chunkIndex &&
+                response.optString("sha256") == chunk.sha256 &&
+                response.optLong("duration_ms", -1L) == chunk.durationMs
+        if (!receiptMatches) throw contractMismatch("chunk_receipt_mismatch")
         return ChunkUploadReceipt(
-            chunkIndex = response.optInt("chunk_index", chunk.chunkIndex),
-            accepted = response.optBoolean("accepted", true),
+            chunkIndex = chunk.chunkIndex,
+            accepted = true,
             duplicate = response.optBoolean("duplicate", false),
             chunksReceived = response.optInt("chunks_received", 0),
             bytesReceived = response.optLong("bytes_received", 0L),
@@ -158,18 +166,22 @@ class ApiClientV2(baseUrl: String, token: String) {
                 .put("chunk_count", session.chunkCount)
                 .put("chunks", manifest)
                 .toBytes(),
-        ).toProgressV2()
+        ).requireV2Session(session.sessionId).toProgressV2()
     }
 
     fun status(sessionId: String): RemoteProgress =
-        http.jsonRequest("GET", "$API_ROOT/sessions/$sessionId", null).toProgressV2()
+        http.jsonRequest("GET", "$API_ROOT/sessions/$sessionId", null)
+            .requireV2Session(sessionId)
+            .toProgressV2()
 
     companion object {
         private const val API_ROOT = "/voice-intake/v2"
     }
 }
 
-private class VoiceHttpClient(private val baseUrl: String, private val token: String) {
+private class VoiceHttpClient(baseUrl: String, private val token: String) {
+    private val serviceBaseUrl = VoiceIntakeV2Policy.normalizeServiceBaseUrl(baseUrl)
+
     fun jsonRequest(method: String, path: String, body: ByteArray?): JSONObject {
         val connection = open(method, path)
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
@@ -195,7 +207,7 @@ private class VoiceHttpClient(private val baseUrl: String, private val token: St
     }
 
     private fun open(method: String, path: String): HttpURLConnection =
-        (URL(baseUrl.trimEnd('/') + path).openConnection() as HttpURLConnection).apply {
+        (URL(serviceBaseUrl + path).openConnection() as HttpURLConnection).apply {
             requestMethod = method
             connectTimeout = 15_000
             readTimeout = 180_000
@@ -243,22 +255,25 @@ private class VoiceHttpClient(private val baseUrl: String, private val token: St
     }
 
     private fun humanMessage(code: String, retry: Int?, reconcile: Boolean): String {
-        val wait = retry?.let { " Повтор через ${formatWait(it)}." }.orEmpty()
+        val wait = retry?.let { " Повтор не раньше чем через ${formatWait(it)}." }.orEmpty()
         return when {
-            reconcile -> "Серверу требуется сверка отправленного запроса; аудио сохранено на телефоне."
-            code == "google_quota_wait" || code == "provider_429" || code.startsWith("quota_exhausted_") ->
+            reconcile || VoiceIntakeV2Policy.requiresManualReconciliation(code, false) ->
+                "Нужна безопасная сверка с сервером; аудио сохранено на телефоне."
+            VoiceIntakeV2Policy.isQuotaCode(code) ->
                 "Доступный лимит Gemini временно исчерпан.$wait Аудио сохранено на телефоне."
             code.contains("limiter") || code.contains("reservation") ->
-                "Общий контроль лимитов недоступен.$wait Аудио сохранено на телефоне."
+                "Общий контроль лимитов временно недоступен.$wait Аудио сохранено на телефоне."
             code.startsWith("provider_") ->
-                "Gemini временно не завершил обработку.$wait Аудио сохранено."
+                "Gemini не завершил обработку.$wait Аудио сохранено."
             code.startsWith("github_") || code.startsWith("idea_hub_") ->
                 "Расшифровка готова, но GitHub ещё не подтверждён.$wait"
-            code.contains("sha256") ->
-                "Сервер отклонил повреждённый аудиосегмент; исходник сохранён."
+            code == "chunks_missing" ->
+                "Серверу не хватает одного или нескольких сегментов; они будут проверены повторно."
             code == "session_not_created" || code.contains("session_not_initialized") ||
                 code.contains("terminology_not_initialized") ->
-                "Серверная сессия не инициализирована; приложение повторит создание и отправку."
+                "Серверная сессия будет безопасно создана повторно."
+            code == "device_token_required" || code == "device_token_invalid" ->
+                "Проверьте device token в настройках; аудио сохранено локально."
             else -> "Стадия не завершена ($code).$wait Исходные данные сохранены."
         }
     }
@@ -281,8 +296,45 @@ private fun requireOrderedChunks(session: SessionSnapshot, chunks: List<ChunkRec
         require(ordered.map { it.chunkIndex } == ordered.indices.toList()) {
             "chunks must be contiguous"
         }
+        if (session.protocolVersion >= 2) {
+            require(ordered.first().startMs == 0L) { "audio timeline must start at zero" }
+            ordered.forEach { chunk ->
+                require(chunk.durationMs > 0L) { "chunk duration must be positive" }
+                require(chunk.wallEndMs > chunk.wallStartMs) { "chunk wall range must increase" }
+            }
+            ordered.zipWithNext().forEach { (previous, current) ->
+                require(current.startMs == previous.endMs) { "audio timeline must be contiguous" }
+                require(current.wallStartMs >= previous.wallEndMs) { "wall timeline must not overlap" }
+            }
+            require(ordered.last().endMs == session.durationMs) {
+                "audio timeline must match recorded duration"
+            }
+            require(ordered.last().wallEndMs <= session.wallElapsedMs) {
+                "wall timeline must not exceed session elapsed time"
+            }
+            require(
+                session.durationMs + session.manualPauseMs + session.autoSilenceSkippedMs ==
+                    session.wallElapsedMs,
+            ) { "session duration accounting must balance" }
+        }
     }
 }
+
+private fun JSONObject.requireV2Session(expectedSessionId: String): JSONObject {
+    if (optString("api_version") != "2.0") throw contractMismatch("api_version_mismatch")
+    if (optString("session_id") != expectedSessionId) throw contractMismatch("session_receipt_mismatch")
+    return this
+}
+
+private fun contractMismatch(code: String): Nothing = throw contractMismatchException(code)
+
+private fun contractMismatchException(code: String) = ApiException(
+    message = "Ответ Voice Intake v2 не совпадает с закреплённым контрактом; аудио сохранено.",
+    code = code,
+    retryable = false,
+    retryAfterSeconds = null,
+    reconciliationRequired = true,
+)
 
 private fun JSONObject.toBytes() = toString().toByteArray(StandardCharsets.UTF_8)
 
@@ -298,7 +350,11 @@ private fun retryAfterFromTimestamp(value: String?): Int? {
         .recoverCatching { OffsetDateTime.parse(value).toInstant().toEpochMilli() }
         .getOrNull() ?: return null
     val remainingMs = epoch - System.currentTimeMillis()
-    return ceil(remainingMs.coerceAtLeast(1L) / 1000.0).toInt().coerceIn(1, 86_400)
+    if (remainingMs <= 0L) return 0
+    return ceil(remainingMs / 1000.0)
+        .coerceAtMost(Int.MAX_VALUE.toDouble())
+        .toInt()
+        .coerceAtLeast(1)
 }
 
 private fun JSONObject.toProgressV1(): RemoteProgress {
