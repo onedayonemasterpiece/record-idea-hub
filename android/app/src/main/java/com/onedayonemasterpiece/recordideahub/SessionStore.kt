@@ -106,7 +106,7 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
         deviceLabel: String,
         protocolVersion: Int = 2,
         capturePolicy: String = CapturePolicy.VOICE_ACTIVITY_AUTO_PAUSE_V1,
-        vadEngine: String? = "webrtc_vad",
+        vadEngine: String? = EfficientVad.ENGINE_NAME,
     ) {
         writableDatabase.insertOrThrow(
             "sessions", null, ContentValues().apply {
@@ -116,7 +116,11 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
                 put("timezone", timezone)
                 put("device_label", deviceLabel)
                 put("capture_state", CaptureState.RECORDING)
-                put("capture_activity", CaptureActivity.AUTO_SILENCE)
+                put("capture_activity", if (capturePolicy == CapturePolicy.CONTINUOUS_V1) {
+                    CaptureActivity.VOICE
+                } else {
+                    CaptureActivity.AUTO_SILENCE
+                })
                 put("capture_policy", capturePolicy)
                 if (vadEngine == null) putNull("vad_engine") else put("vad_engine", vadEngine)
                 put("remote_state", RemoteState.LOCAL_ONLY)
@@ -157,6 +161,19 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
     }
 
     @Synchronized
+    fun markCaptureFallbackContinuous(sessionId: String): Boolean =
+        writableDatabase.update(
+            "sessions",
+            ContentValues().apply {
+                put("capture_policy", CapturePolicy.CONTINUOUS_V1)
+                putNull("vad_engine")
+                put("capture_activity", CaptureActivity.FALLBACK_CONTINUOUS)
+            },
+            "session_id=? AND protocol_version>=2 AND server_initialized=0 AND complete_sent=0",
+            arrayOf(sessionId),
+        ) == 1
+
+    @Synchronized
     fun updateCaptureProgress(
         sessionId: String,
         durationMs: Long,
@@ -165,15 +182,33 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
         autoSilenceSkippedMs: Long,
         activity: String,
     ) {
-        writableDatabase.update(
-            "sessions", ContentValues().apply {
-                put("duration_ms", durationMs.coerceAtLeast(0L))
-                put("wall_elapsed_ms", wallElapsedMs.coerceAtLeast(0L))
-                put("manual_pause_ms", manualPauseMs.coerceAtLeast(0L))
-                put("auto_silence_skipped_ms", autoSilenceSkippedMs.coerceAtLeast(0L))
-                put("capture_activity", activity)
-            }, "session_id=?", arrayOf(sessionId),
-        )
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            db.update(
+                "sessions", ContentValues().apply {
+                    put("duration_ms", durationMs.coerceAtLeast(0L))
+                    put("wall_elapsed_ms", wallElapsedMs.coerceAtLeast(0L))
+                    put("manual_pause_ms", manualPauseMs.coerceAtLeast(0L))
+                    put("auto_silence_skipped_ms", autoSilenceSkippedMs.coerceAtLeast(0L))
+                    put("capture_activity", activity)
+                }, "session_id=?", arrayOf(sessionId),
+            )
+            if (activity == CaptureActivity.FALLBACK_CONTINUOUS) {
+                db.update(
+                    "sessions",
+                    ContentValues().apply {
+                        put("capture_policy", CapturePolicy.CONTINUOUS_V1)
+                        putNull("vad_engine")
+                    },
+                    "session_id=? AND protocol_version>=2 AND server_initialized=0 AND complete_sent=0",
+                    arrayOf(sessionId),
+                )
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
     }
 
     @Synchronized
@@ -198,9 +233,22 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
         db.execSQL(
             """
             UPDATE sessions SET manual_pause_ms=manual_pause_ms+?, manual_pause_started_epoch_ms=NULL,
-                capture_state=?, capture_activity=? WHERE session_id=?
+                capture_state=?,
+                capture_activity=CASE WHEN capture_policy=? THEN ? ELSE ? END,
+                remote_state=CASE WHEN protocol_version>=2 AND server_initialized=0 THEN ? ELSE remote_state END,
+                last_error=CASE WHEN protocol_version>=2 AND server_initialized=0 THEN NULL ELSE last_error END,
+                retry_at_epoch_ms=CASE WHEN protocol_version>=2 AND server_initialized=0 THEN NULL ELSE retry_at_epoch_ms END
+            WHERE session_id=?
             """.trimIndent(),
-            arrayOf<Any?>(additional, CaptureState.RECORDING, CaptureActivity.AUTO_SILENCE, sessionId),
+            arrayOf<Any?>(
+                additional,
+                CaptureState.RECORDING,
+                CapturePolicy.CONTINUOUS_V1,
+                CaptureActivity.VOICE,
+                CaptureActivity.AUTO_SILENCE,
+                RemoteState.LOCAL_ONLY,
+                sessionId,
+            ),
         )
     }
 
@@ -268,16 +316,28 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
 
     @Synchronized
     fun finishSession(sessionId: String, endedAt: String, wallElapsedMs: Long, autoSilenceSkippedMs: Long) {
-        writableDatabase.update(
-            "sessions", ContentValues().apply {
-                put("ended_at", endedAt)
-                put("wall_elapsed_ms", wallElapsedMs.coerceAtLeast(0L))
-                put("auto_silence_skipped_ms", autoSilenceSkippedMs.coerceAtLeast(0L))
-                put("capture_state", CaptureState.FINISHED)
-                put("capture_activity", CaptureActivity.IDLE)
-                putNull("manual_pause_started_epoch_ms")
-            }, "session_id=?", arrayOf(sessionId),
-        )
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            db.update(
+                "sessions", ContentValues().apply {
+                    put("ended_at", endedAt)
+                    put("wall_elapsed_ms", wallElapsedMs.coerceAtLeast(0L))
+                    put("auto_silence_skipped_ms", autoSilenceSkippedMs.coerceAtLeast(0L))
+                    put("capture_state", CaptureState.FINISHED)
+                    put("capture_activity", CaptureActivity.IDLE)
+                    putNull("manual_pause_started_epoch_ms")
+                }, "session_id=?", arrayOf(sessionId),
+            )
+            db.execSQL(
+                """
+                UPDATE sessions SET remote_state=?,last_error=NULL,retry_at_epoch_ms=NULL
+                WHERE session_id=? AND protocol_version>=2 AND server_initialized=0
+                """.trimIndent(),
+                arrayOf<Any?>(RemoteState.LOCAL_ONLY, sessionId),
+            )
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
     }
 
     @Synchronized
@@ -302,6 +362,31 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
                 "session_id=? AND chunk_index=?", arrayOf(sessionId, chunkIndex.toString()),
             ) == 1) { "chunk disappeared before upload receipt persistence" }
             refreshChunkCounters(db, sessionId)
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
+
+    @Synchronized
+    fun markAllV2ChunksPending(sessionId: String) {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            db.update(
+                "chunks",
+                ContentValues().apply { put("uploaded", 0) },
+                "session_id=?",
+                arrayOf(sessionId),
+            )
+            db.update(
+                "sessions",
+                ContentValues().apply {
+                    put("chunks_uploaded", 0)
+                    put("complete_sent", 0)
+                    put("poll_count", 0)
+                },
+                "session_id=? AND protocol_version>=2",
+                arrayOf(sessionId),
+            )
             db.setTransactionSuccessful()
         } finally { db.endTransaction() }
     }
@@ -334,12 +419,27 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
     }
 
     @Synchronized
-    fun sessionsNeedingSync(): List<SessionSnapshot> {
+    fun sessionsNeedingSync(nowEpochMs: Long = System.currentTimeMillis()): List<SessionSnapshot> {
         readableDatabase.query(
-            "sessions", SESSION_COLUMNS,
-            "capture_state IN (?, ?) AND remote_state != ?",
-            arrayOf(CaptureState.PAUSED, CaptureState.FINISHED, RemoteState.PUBLISHED_VERIFIED),
-            null, null, "created_at ASC",
+            "sessions",
+            SESSION_COLUMNS,
+            """
+            ((protocol_version>=2 AND capture_state=?) OR
+             (protocol_version<2 AND capture_state IN (?, ?)))
+            AND remote_state NOT IN (?, ?)
+            AND (retry_at_epoch_ms IS NULL OR retry_at_epoch_ms<=?)
+            """.trimIndent(),
+            arrayOf(
+                CaptureState.FINISHED,
+                CaptureState.PAUSED,
+                CaptureState.FINISHED,
+                RemoteState.PUBLISHED_VERIFIED,
+                RemoteState.RECONCILIATION_REQUIRED,
+                nowEpochMs.toString(),
+            ),
+            null,
+            null,
+            "created_at ASC",
         ).use { cursor -> return buildList { while (cursor.moveToNext()) add(cursor.toSession()) } }
     }
 
@@ -350,6 +450,7 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
                 put("server_initialized", 1)
                 put("remote_state", RemoteState.RECEIVING)
                 putNull("last_error")
+                putNull("retry_at_epoch_ms")
             }, "session_id=?", arrayOf(sessionId),
         )
     }
@@ -361,6 +462,7 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
                 put("complete_sent", 1)
                 put("remote_state", RemoteState.QUEUED)
                 put("poll_count", 0)
+                putNull("retry_at_epoch_ms")
             }, "session_id=?", arrayOf(sessionId),
         )
     }
@@ -370,24 +472,41 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
         val db = writableDatabase
         val current = db.rawQuery("SELECT poll_count FROM sessions WHERE session_id=?", arrayOf(sessionId))
             .use { cursor -> if (cursor.moveToFirst()) cursor.getInt(0) else 0 }
-        val next = (current + 1).coerceAtMost(10)
-        db.update("sessions", ContentValues().apply { put("poll_count", next) }, "session_id=?", arrayOf(sessionId))
-        return when (next) { 1 -> 3L; 2 -> 5L; 3 -> 8L; 4 -> 12L; else -> 15L }
+        val next = (current + 1).coerceAtMost(100)
+        val delay = VoiceIntakeV2Policy.pollDelaySeconds(next)
+        db.update(
+            "sessions",
+            ContentValues().apply {
+                put("poll_count", next)
+                put("retry_at_epoch_ms", System.currentTimeMillis() + delay * 1000L)
+            },
+            "session_id=?",
+            arrayOf(sessionId),
+        )
+        return delay
     }
 
     @Synchronized
     fun updateRemoteProgress(sessionId: String, progress: RemoteProgress) {
+        val previousState = readableDatabase.rawQuery(
+            "SELECT remote_state FROM sessions WHERE session_id=?",
+            arrayOf(sessionId),
+        ).use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
         writableDatabase.update(
             "sessions", ContentValues().apply {
                 put("remote_state", progress.state)
-                if (progress.chunksUploaded > 0 || progress.githubVerified) put("chunks_uploaded", progress.chunksUploaded)
-                if (progress.chunksTranscribed > 0 || progress.transcriptionComplete) put("chunks_transcribed", progress.chunksTranscribed)
+                put("chunks_uploaded", progress.chunksUploaded.coerceAtLeast(0))
+                if (progress.chunksTranscribed > 0 || progress.transcriptionComplete) {
+                    put("chunks_transcribed", progress.chunksTranscribed)
+                }
                 if (progress.githubUrl == null) putNull("github_url") else put("github_url", progress.githubUrl)
-                if (progress.githubCommitSha == null) putNull("github_commit_sha") else put("github_commit_sha", progress.githubCommitSha)
+                if (progress.githubCommitSha == null) putNull("github_commit_sha") else {
+                    put("github_commit_sha", progress.githubCommitSha)
+                }
                 val message = progress.lastError ?: progress.errorCode
                 if (message == null) putNull("last_error") else put("last_error", message)
-                if (progress.state != RemoteState.WAITING_FOR_QUOTA) putNull("retry_at_epoch_ms")
-                if (progress.githubVerified) put("poll_count", 0)
+                putNull("retry_at_epoch_ms")
+                if (previousState != progress.state || progress.githubVerified) put("poll_count", 0)
             }, "session_id=?", arrayOf(sessionId),
         )
     }
@@ -398,17 +517,30 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
             "sessions", ContentValues().apply {
                 put("remote_state", state)
                 if (message == null) putNull("last_error") else put("last_error", message)
-                if (state != RemoteState.WAITING_FOR_QUOTA) putNull("retry_at_epoch_ms")
+                putNull("retry_at_epoch_ms")
             }, "session_id=?", arrayOf(sessionId),
         )
     }
 
     @Synchronized
-    fun setQuotaWait(sessionId: String, retryAfterSeconds: Int, message: String) {
+    fun setRetryableError(sessionId: String, delaySeconds: Long, message: String?) {
+        val delay = delaySeconds.coerceAtLeast(1L)
+        writableDatabase.update(
+            "sessions", ContentValues().apply {
+                put("remote_state", RemoteState.RETRYABLE_ERROR)
+                put("retry_at_epoch_ms", System.currentTimeMillis() + delay * 1000L)
+                if (message == null) putNull("last_error") else put("last_error", message)
+            }, "session_id=?", arrayOf(sessionId),
+        )
+    }
+
+    @Synchronized
+    fun setQuotaWait(sessionId: String, retryAfterSeconds: Long, message: String) {
+        val delay = retryAfterSeconds.coerceAtLeast(1L)
         writableDatabase.update(
             "sessions", ContentValues().apply {
                 put("remote_state", RemoteState.WAITING_FOR_QUOTA)
-                put("retry_at_epoch_ms", System.currentTimeMillis() + retryAfterSeconds.coerceAtLeast(1) * 1000L)
+                put("retry_at_epoch_ms", System.currentTimeMillis() + delay * 1000L)
                 put("last_error", message)
             }, "session_id=?", arrayOf(sessionId),
         )
@@ -419,6 +551,7 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
         writableDatabase.update(
             "sessions", ContentValues().apply {
                 put("remote_state", RemoteState.RETRYABLE_ERROR)
+                putNull("retry_at_epoch_ms")
                 if (message == null) putNull("last_error") else put("last_error", message)
             }, "session_id=?", arrayOf(sessionId),
         )
@@ -431,12 +564,21 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
     }
 
     @Synchronized
-    fun deleteAllVerifiedAudio() {
+    fun deleteAllVerifiedAudio(): Boolean {
         val ids = readableDatabase.query(
-            "sessions", arrayOf("session_id"), "remote_state=? AND audio_deleted=0",
-            arrayOf(RemoteState.PUBLISHED_VERIFIED), null, null, "created_at ASC",
+            "sessions",
+            arrayOf("session_id"),
+            "remote_state=? AND audio_deleted=0",
+            arrayOf(RemoteState.PUBLISHED_VERIFIED),
+            null,
+            null,
+            "created_at ASC",
         ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.getString(0)) } }
-        ids.forEach(::deleteVerifiedAudio)
+        var allDeleted = true
+        for (sessionId in ids) {
+            if (!deleteVerifiedAudio(sessionId)) allDeleted = false
+        }
+        return allDeleted
     }
 
     @Synchronized
@@ -447,7 +589,17 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
             file.exists() && !file.delete()
         }
         if (failed.isNotEmpty()) {
-            setLocalError(sessionId, "GitHub подтверждён, но локальное аудио пока не удалено")
+            writableDatabase.update(
+                "sessions",
+                ContentValues().apply {
+                    put("remote_state", RemoteState.PUBLISHED_VERIFIED)
+                    put("last_error", "Сервер и GitHub подтверждены; локальное аудио будет удалено повторно")
+                    put("audio_deleted", 0)
+                    putNull("retry_at_epoch_ms")
+                },
+                "session_id=?",
+                arrayOf(sessionId),
+            )
             return false
         }
         val db = writableDatabase
@@ -456,11 +608,16 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
             db.update("chunks", ContentValues().apply { put("path", "") }, "session_id=?", arrayOf(sessionId))
             db.update(
                 "sessions", ContentValues().apply {
-                    put("audio_deleted", 1); putNull("last_error"); putNull("retry_at_epoch_ms")
+                    put("audio_deleted", 1)
+                    put("remote_state", RemoteState.PUBLISHED_VERIFIED)
+                    putNull("last_error")
+                    putNull("retry_at_epoch_ms")
                 }, "session_id=?", arrayOf(sessionId),
             )
             db.setTransactionSuccessful()
-        } finally { db.endTransaction() }
+        } finally {
+            db.endTransaction()
+        }
         return true
     }
 
