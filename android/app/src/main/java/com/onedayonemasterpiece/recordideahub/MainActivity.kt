@@ -430,19 +430,28 @@ class MainActivity : Activity() {
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (
-            requestCode == REQUEST_PERMISSIONS &&
-            grantResults.all { it == PackageManager.PERMISSION_GRANTED } &&
-            pendingStart
-        ) {
-            pendingStart = false
-            val action = if (store.activeSession()?.captureState == CaptureState.PAUSED) {
-                RecordingService.ACTION_RESUME
-            } else {
-                RecordingService.ACTION_START
-            }
-            startLocalCapture(action)
+        if (requestCode != REQUEST_PERMISSIONS || !pendingStart) return
+        pendingStart = false
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(this, "Для локальной записи нужен доступ к микрофону", Toast.LENGTH_LONG).show()
+            return
         }
+        if (
+            Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            Toast.makeText(
+                this,
+                "Запись продолжится без обычных уведомлений; управление остаётся в приложении.",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+        val action = if (store.activeSession()?.captureState == CaptureState.PAUSED) {
+            RecordingService.ACTION_RESUME
+        } else {
+            RecordingService.ACTION_START
+        }
+        startLocalCapture(action)
     }
 
     private fun showSettings() {
