@@ -5,7 +5,6 @@ import com.konovalov.vad.webrtc.config.FrameSize
 import com.konovalov.vad.webrtc.config.Mode
 import com.konovalov.vad.webrtc.config.SampleRate
 import java.io.Closeable
-import kotlin.math.max
 import kotlin.math.sqrt
 
 class EfficientVad(private val enabled: Boolean) : Closeable {
@@ -13,9 +12,9 @@ class EfficientVad(private val enabled: Boolean) : Closeable {
         runCatching {
             VadWebRTC(
                 sampleRate = SampleRate.SAMPLE_RATE_16K,
-                frameSize = FrameSize.FRAME_SIZE_320,
+                frameSize = FrameSize.FRAME_SIZE_480,
                 mode = Mode.LOW_BITRATE,
-                speechDurationMs = 60,
+                speechDurationMs = 0,
                 silenceDurationMs = 0,
             )
         }.getOrNull()
@@ -23,17 +22,7 @@ class EfficientVad(private val enabled: Boolean) : Closeable {
         null
     }
     private var failedOpen = enabled && detector == null
-    private var noiseFloorRms = 180.0
-    private var frameCounter = 0L
-
-    val engineName: String?
-        get() = if (enabled) "webrtc_vad" else null
-
-    val engineVersion: String?
-        get() = if (enabled) "2.0.10-cf.4" else null
-
-    val configVersion: String?
-        get() = if (enabled) "vad-auto-pause-efficient-v1" else null
+    private var noiseFloorRms = 80.0
 
     val isFailOpen: Boolean
         get() = failedOpen
@@ -41,23 +30,29 @@ class EfficientVad(private val enabled: Boolean) : Closeable {
     fun isSpeech(frame: ShortArray): Boolean {
         if (!enabled || failedOpen) return true
         val activeDetector = detector ?: return true
-        frameCounter++
         val rms = rms(frame)
-        val threshold = max(90.0, noiseFloorRms * 1.18)
-        val shouldInspect = rms >= threshold || frameCounter % 5L == 0L
+
+        // Skip JNI only for near-digital silence. WebRTC VAD is deliberately still called for
+        // quiet acoustic frames so an energy threshold cannot clip soft speech beginnings.
+        if (rms <= DIGITAL_SILENCE_RMS) {
+            updateNoiseFloor(rms)
+            return false
+        }
         return try {
-            val speech = shouldInspect && activeDetector.isSpeech(frame)
-            if (!speech) {
-                val bounded = rms.coerceAtMost(noiseFloorRms * 3.0 + 200.0)
-                noiseFloorRms = noiseFloorRms * 0.995 + bounded * 0.005
+            activeDetector.isSpeech(frame).also { speech ->
+                if (!speech) updateNoiseFloor(rms)
             }
-            speech
         } catch (_: Throwable) {
             failedOpen = true
             runCatching { activeDetector.close() }
             detector = null
             true
         }
+    }
+
+    private fun updateNoiseFloor(value: Double) {
+        val bounded = value.coerceAtMost(noiseFloorRms * 3.0 + 200.0)
+        noiseFloorRms = noiseFloorRms * 0.995 + bounded * 0.005
     }
 
     private fun rms(frame: ShortArray): Double {
@@ -76,7 +71,12 @@ class EfficientVad(private val enabled: Boolean) : Closeable {
     }
 
     companion object {
-        const val FRAME_SAMPLES = 320
-        const val FRAME_MS = 20L
+        const val ENGINE_NAME = "webrtc_vad"
+        const val ENGINE_VERSION = "2.0.10-cf.4"
+        const val CONFIG_VERSION = "vad-auto-pause-efficient-v1"
+        const val MODE = 1
+        const val FRAME_SAMPLES = 480
+        const val FRAME_MS = 30L
+        private const val DIGITAL_SILENCE_RMS = 20.0
     }
 }

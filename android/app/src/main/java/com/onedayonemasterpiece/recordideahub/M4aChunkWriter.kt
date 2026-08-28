@@ -6,7 +6,10 @@ import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import java.io.File
+import java.io.FileOutputStream
 import java.nio.ByteOrder
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import kotlin.math.roundToLong
 
@@ -107,7 +110,8 @@ class M4aChunkWriter(
             muxer.release()
         }
         check(partFile.isFile && partFile.length() > 0L) { "AAC/M4A encoder produced no file" }
-        check(partFile.renameTo(targetFile)) { "failed to finalize M4A chunk" }
+        FileOutputStream(partFile, true).use { it.fd.sync() }
+        atomicMove(partFile, targetFile)
         return ClosedChunk(
             sessionId = sessionId,
             chunkIndex = chunkIndex,
@@ -230,6 +234,19 @@ class M4aChunkWriter(
 
         private fun samplesToMs(samples: Long): Long =
             (samples.toDouble() * 1000.0 / AudioProfile.SAMPLE_RATE_HZ).roundToLong()
+
+        private fun atomicMove(source: File, target: File) {
+            runCatching {
+                Files.move(
+                    source.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            }.getOrElse {
+                Files.move(source.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            }
+        }
 
         private fun sha256(file: File): String {
             val digest = MessageDigest.getInstance("SHA-256")
