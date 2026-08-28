@@ -38,6 +38,7 @@ data class SessionSnapshot(
     val githubUrl: String?,
     val githubCommitSha: String?,
     val lastError: String?,
+    val retryAtEpochMs: Long?,
 )
 
 data class ChunkRecord(
@@ -48,6 +49,16 @@ data class ChunkRecord(
     val path: String,
     val sha256: String,
     val uploaded: Boolean,
+    val transcriptJson: String?,
+) {
+    val transcribed: Boolean
+        get() = !transcriptJson.isNullOrBlank()
+}
+
+data class ChunkTranscriptResult(
+    val transcriptJson: String,
+    val model: String,
+    val requestUid: String,
 )
 
 data class RemoteProgress(
