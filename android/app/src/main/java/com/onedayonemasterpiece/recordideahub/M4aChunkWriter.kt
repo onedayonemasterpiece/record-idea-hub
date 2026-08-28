@@ -48,11 +48,15 @@ class M4aChunkWriter(
         targetFile = File(directory, "$stem.m4a")
         partFile.delete()
         targetFile.delete()
-        encoder = createEncoder(format)
+        encoder = createStartedEncoder(format)
         selectedCodecName = encoder.name
-        encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        encoder.start()
-        muxer = MediaMuxer(partFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        muxer = try {
+            MediaMuxer(partFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        } catch (exc: Exception) {
+            runCatching { encoder.stop() }
+            encoder.release()
+            throw exc
+        }
     }
 
     val durationMs: Long
@@ -210,7 +214,7 @@ class M4aChunkWriter(
         private const val MAX_INPUT_ATTEMPTS = 100
         private const val MAX_EOS_IDLE_ROUNDS = 300
 
-        private fun createEncoder(format: MediaFormat): MediaCodec {
+        private fun createStartedEncoder(format: MediaFormat): MediaCodec {
             val candidates = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
                 .filter { info ->
                     info.isEncoder && info.supportedTypes.any {
@@ -227,9 +231,22 @@ class M4aChunkWriter(
                     candidate.getCapabilitiesForType(MediaFormat.MIMETYPE_AUDIO_AAC)
                         .isFormatSupported(format)
                 }.getOrDefault(false)
-                if (supported) return MediaCodec.createByCodecName(candidate.name)
+                if (!supported) continue
+                val codec = runCatching { MediaCodec.createByCodecName(candidate.name) }.getOrNull()
+                    ?: continue
+                try {
+                    codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                    codec.start()
+                    return codec
+                } catch (_: Exception) {
+                    runCatching { codec.stop() }
+                    codec.release()
+                }
             }
-            return MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+            return MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).also { codec ->
+                codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                codec.start()
+            }
         }
 
         private fun samplesToMs(samples: Long): Long =
