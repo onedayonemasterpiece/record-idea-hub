@@ -35,6 +35,7 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
                 github_url TEXT,
                 github_commit_sha TEXT,
                 last_error TEXT,
+                retry_at_epoch_ms INTEGER,
                 audio_deleted INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             )
@@ -50,16 +51,22 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
                 path TEXT NOT NULL,
                 sha256 TEXT NOT NULL,
                 uploaded INTEGER NOT NULL DEFAULT 0,
+                transcript_json TEXT,
                 PRIMARY KEY (session_id, chunk_index),
                 FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
             )
             """.trimIndent(),
         )
         db.execSQL("CREATE INDEX idx_sessions_sync ON sessions(remote_state, capture_state, created_at)")
-        db.execSQL("CREATE INDEX idx_chunks_upload ON chunks(session_id, uploaded, chunk_index)")
+        db.execSQL("CREATE INDEX idx_chunks_upload ON chunks(session_id, transcript_json, chunk_index)")
     }
 
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 2) {
+            db.execSQL("ALTER TABLE sessions ADD COLUMN retry_at_epoch_ms INTEGER")
+            db.execSQL("ALTER TABLE chunks ADD COLUMN transcript_json TEXT")
+        }
+    }
 
     @Synchronized
     fun createSession(sessionId: String, startedAt: String, timezone: String, deviceLabel: String) {
@@ -168,6 +175,7 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
                     put("path", path)
                     put("sha256", sha256)
                     put("uploaded", 0)
+                    putNull("transcript_json")
                 },
                 SQLiteDatabase.CONFLICT_IGNORE,
             )
@@ -178,7 +186,7 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
                     duration_ms=MAX(duration_ms, ?)
                 WHERE session_id=?
                 """.trimIndent(),
-                arrayOf(sessionId, endMs, sessionId),
+                arrayOf<Any?>(sessionId, endMs, sessionId),
             )
             db.setTransactionSuccessful()
         } finally {
@@ -201,7 +209,7 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
 
     @Synchronized
     fun chunks(sessionId: String, pendingOnly: Boolean = false): List<ChunkRecord> {
-        val selection = if (pendingOnly) "session_id=? AND uploaded=0" else "session_id=?"
+        val selection = if (pendingOnly) "session_id=? AND transcript_json IS NULL" else "session_id=?"
         readableDatabase.query(
             "chunks",
             CHUNK_COLUMNS,
@@ -218,13 +226,47 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
     }
 
     @Synchronized
-    fun markChunkUploaded(sessionId: String, chunkIndex: Int) {
-        writableDatabase.update(
-            "chunks",
-            ContentValues().apply { put("uploaded", 1) },
-            "session_id=? AND chunk_index=?",
-            arrayOf(sessionId, chunkIndex.toString()),
-        )
+    fun saveChunkTranscript(sessionId: String, chunkIndex: Int, result: ChunkTranscriptResult) {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val changed = db.update(
+                "chunks",
+                ContentValues().apply {
+                    put("uploaded", 1)
+                    put("transcript_json", result.transcriptJson)
+                },
+                "session_id=? AND chunk_index=?",
+                arrayOf(sessionId, chunkIndex.toString()),
+            )
+            check(changed == 1) { "chunk disappeared before transcript persistence" }
+            db.execSQL(
+                """
+                UPDATE sessions
+                SET chunks_uploaded=(
+                        SELECT COUNT(*) FROM chunks
+                        WHERE session_id=? AND uploaded=1
+                    ),
+                    chunks_transcribed=(
+                        SELECT COUNT(*) FROM chunks
+                        WHERE session_id=? AND transcript_json IS NOT NULL
+                    ),
+                    remote_state=?,
+                    retry_at_epoch_ms=NULL,
+                    last_error=NULL
+                WHERE session_id=?
+                """.trimIndent(),
+                arrayOf<Any?>(
+                    sessionId,
+                    sessionId,
+                    RemoteState.PROCESSING,
+                    sessionId,
+                ),
+            )
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
     }
 
     @Synchronized
@@ -250,11 +292,49 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
             "sessions",
             ContentValues().apply {
                 put("remote_state", progress.state)
-                put("chunks_uploaded", progress.chunksUploaded)
-                put("chunks_transcribed", progress.chunksTranscribed)
-                put("github_url", progress.githubUrl)
-                put("github_commit_sha", progress.githubCommitSha)
-                put("last_error", progress.lastError)
+                if (progress.chunksUploaded > 0 || progress.githubVerified) {
+                    put("chunks_uploaded", progress.chunksUploaded)
+                }
+                if (progress.chunksTranscribed > 0 || progress.githubVerified) {
+                    put("chunks_transcribed", progress.chunksTranscribed)
+                }
+                if (progress.githubUrl == null) putNull("github_url") else put("github_url", progress.githubUrl)
+                if (progress.githubCommitSha == null) {
+                    putNull("github_commit_sha")
+                } else {
+                    put("github_commit_sha", progress.githubCommitSha)
+                }
+                if (progress.lastError == null) putNull("last_error") else put("last_error", progress.lastError)
+                if (progress.state != RemoteState.WAITING_FOR_QUOTA) putNull("retry_at_epoch_ms")
+            },
+            "session_id=?",
+            arrayOf(sessionId),
+        )
+    }
+
+    @Synchronized
+    fun setRemoteState(sessionId: String, state: String, message: String? = null) {
+        writableDatabase.update(
+            "sessions",
+            ContentValues().apply {
+                put("remote_state", state)
+                if (message == null) putNull("last_error") else put("last_error", message)
+                if (state != RemoteState.WAITING_FOR_QUOTA) putNull("retry_at_epoch_ms")
+            },
+            "session_id=?",
+            arrayOf(sessionId),
+        )
+    }
+
+    @Synchronized
+    fun setQuotaWait(sessionId: String, retryAfterSeconds: Int, message: String) {
+        val retryAt = System.currentTimeMillis() + retryAfterSeconds.coerceAtLeast(1) * 1000L
+        writableDatabase.update(
+            "sessions",
+            ContentValues().apply {
+                put("remote_state", RemoteState.WAITING_FOR_QUOTA)
+                put("retry_at_epoch_ms", retryAt)
+                put("last_error", message)
             },
             "session_id=?",
             arrayOf(sessionId),
@@ -265,7 +345,10 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
     fun setLocalError(sessionId: String, message: String?) {
         writableDatabase.update(
             "sessions",
-            ContentValues().apply { put("last_error", message) },
+            ContentValues().apply {
+                put("remote_state", RemoteState.RETRYABLE_ERROR)
+                if (message == null) putNull("last_error") else put("last_error", message)
+            },
             "session_id=?",
             arrayOf(sessionId),
         )
@@ -273,7 +356,9 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
 
     @Synchronized
     fun discardSession(sessionId: String) {
-        chunks(sessionId).forEach { File(it.path).delete() }
+        chunks(sessionId).forEach { record ->
+            if (record.path.isNotBlank()) File(record.path).delete()
+        }
         writableDatabase.delete("sessions", "session_id=?", arrayOf(sessionId))
     }
 
@@ -299,6 +384,7 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
     fun deleteVerifiedAudio(sessionId: String): Boolean {
         val records = chunks(sessionId)
         val failed = records.filter { record ->
+            if (record.path.isBlank()) return@filter false
             val file = File(record.path)
             file.exists() && !file.delete()
         }
@@ -309,12 +395,18 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
         val db = writableDatabase
         db.beginTransaction()
         try {
-            db.delete("chunks", "session_id=?", arrayOf(sessionId))
+            db.update(
+                "chunks",
+                ContentValues().apply { put("path", "") },
+                "session_id=?",
+                arrayOf(sessionId),
+            )
             db.update(
                 "sessions",
                 ContentValues().apply {
                     put("audio_deleted", 1)
                     putNull("last_error")
+                    putNull("retry_at_epoch_ms")
                 },
                 "session_id=?",
                 arrayOf(sessionId),
@@ -338,9 +430,10 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
         remoteState = getString(getColumnIndexOrThrow("remote_state")),
         chunksUploaded = getInt(getColumnIndexOrThrow("chunks_uploaded")),
         chunksTranscribed = getInt(getColumnIndexOrThrow("chunks_transcribed")),
-        githubUrl = getString(getColumnIndexOrThrow("github_url")),
-        githubCommitSha = getString(getColumnIndexOrThrow("github_commit_sha")),
-        lastError = getString(getColumnIndexOrThrow("last_error")),
+        githubUrl = nullableString("github_url"),
+        githubCommitSha = nullableString("github_commit_sha"),
+        lastError = nullableString("last_error"),
+        retryAtEpochMs = nullableLong("retry_at_epoch_ms"),
     )
 
     private fun Cursor.toChunk() = ChunkRecord(
@@ -351,11 +444,22 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
         path = getString(getColumnIndexOrThrow("path")),
         sha256 = getString(getColumnIndexOrThrow("sha256")),
         uploaded = getInt(getColumnIndexOrThrow("uploaded")) != 0,
+        transcriptJson = nullableString("transcript_json"),
     )
+
+    private fun Cursor.nullableString(name: String): String? {
+        val index = getColumnIndexOrThrow(name)
+        return if (isNull(index)) null else getString(index)
+    }
+
+    private fun Cursor.nullableLong(name: String): Long? {
+        val index = getColumnIndexOrThrow(name)
+        return if (isNull(index)) null else getLong(index)
+    }
 
     companion object {
         private const val DB_NAME = "record-idea-hub.sqlite3"
-        private const val DB_VERSION = 1
+        private const val DB_VERSION = 2
         private val SESSION_COLUMNS = arrayOf(
             "session_id",
             "started_at",
@@ -371,6 +475,7 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
             "github_url",
             "github_commit_sha",
             "last_error",
+            "retry_at_epoch_ms",
         )
         private val CHUNK_COLUMNS = arrayOf(
             "session_id",
@@ -380,6 +485,7 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
             "path",
             "sha256",
             "uploaded",
+            "transcript_json",
         )
     }
 }
