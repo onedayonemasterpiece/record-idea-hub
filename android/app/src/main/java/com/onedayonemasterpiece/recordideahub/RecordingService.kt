@@ -13,21 +13,22 @@ import android.content.pm.ServiceInfo
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.os.IBinder
-import android.os.PowerManager
 import java.io.File
+import java.time.Duration
 import java.time.OffsetDateTime
-import kotlin.math.sqrt
+import java.util.ArrayDeque
 
 class RecordingService : Service() {
     @Volatile private var captureRequested = false
     @Volatile private var audioRecord: AudioRecord? = null
     private var captureThread: Thread? = null
     private val store by lazy { AppGraph.store(this) }
+    private val config by lazy { AppGraph.config(this) }
     private val audioDirectory by lazy { File(filesDir, "audio") }
     private var sessionId: String? = null
-    private var wakeLock: PowerManager.WakeLock? = null
     private val runtime by lazy { RecordingRuntime(this) }
 
     override fun onCreate() {
@@ -51,13 +52,21 @@ class RecordingService : Service() {
         if (store.activeSession() != null) return
         val id = newSessionId()
         sessionId = id
+        val autoSilence = config.autoSilenceEnabled
         store.createSession(
             sessionId = id,
             startedAt = OffsetDateTime.now().toString(),
             timezone = currentTimezone(),
             deviceLabel = "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
+            protocolVersion = 2,
+            capturePolicy = if (autoSilence) {
+                CapturePolicy.VOICE_ACTIVITY_AUTO_PAUSE_V1
+            } else {
+                CapturePolicy.CONTINUOUS_V1
+            },
+            vadEngine = if (autoSilence) "webrtc_vad" else null,
         )
-        enterForeground("Запись идёт", paused = false)
+        enterForeground("Слушаю · тишина не записывается", paused = false)
         beginCapture()
         broadcast()
     }
@@ -65,10 +74,17 @@ class RecordingService : Service() {
     private fun pauseSession() {
         val active = store.activeSession() ?: return
         sessionId = active.sessionId
-        stopCapture()
-        store.setCaptureState(active.sessionId, CaptureState.PAUSED)
-        runtime.update(active.sessionId, store.session(active.sessionId)?.durationMs ?: active.durationMs)
-        enterForeground("Запись на паузе", paused = true)
+        if (active.captureState == CaptureState.RECORDING) stopCapture()
+        store.beginManualPause(active.sessionId)
+        val refreshed = store.session(active.sessionId) ?: active
+        runtime.update(
+            active.sessionId,
+            refreshed.durationMs,
+            elapsedFromStart(refreshed.startedAt),
+            refreshed.autoSilenceSkippedMs,
+            CaptureActivity.MANUAL_PAUSE,
+        )
+        enterForeground("Пауза · микрофон остановлен", paused = true)
         SyncScheduler.enqueue(this)
         broadcast()
     }
@@ -76,8 +92,8 @@ class RecordingService : Service() {
     private fun resumeSession() {
         val active = store.activeSession() ?: return
         sessionId = active.sessionId
-        store.setCaptureState(active.sessionId, CaptureState.RECORDING)
-        enterForeground("Запись идёт", paused = false)
+        store.endManualPause(active.sessionId)
+        enterForeground("Слушаю · тишина не записывается", paused = false)
         beginCapture()
         broadcast()
     }
@@ -85,7 +101,11 @@ class RecordingService : Service() {
     private fun finishSession() {
         val active = store.activeSession() ?: return
         sessionId = active.sessionId
-        stopCapture()
+        if (active.captureState == CaptureState.RECORDING) {
+            stopCapture()
+        } else {
+            store.endManualPause(active.sessionId)
+        }
         val refreshed = store.session(active.sessionId) ?: return
         if (refreshed.durationMs < MIN_SESSION_MS || refreshed.chunkCount == 0) {
             store.discardSession(active.sessionId)
@@ -95,7 +115,17 @@ class RecordingService : Service() {
             broadcast("Слишком короткая запись удалена")
             return
         }
-        store.finishSession(active.sessionId, OffsetDateTime.now().toString())
+        val endedAt = OffsetDateTime.now()
+        val wallElapsed = elapsedBetween(refreshed.startedAt, endedAt)
+        val autoSkipped = (
+            wallElapsed - refreshed.manualPauseMs - refreshed.durationMs
+            ).coerceAtLeast(0L)
+        store.finishSession(
+            sessionId = active.sessionId,
+            endedAt = endedAt.toString(),
+            wallElapsedMs = wallElapsed,
+            autoSilenceSkippedMs = autoSkipped,
+        )
         runtime.clear(active.sessionId)
         SyncScheduler.enqueue(this)
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -111,18 +141,15 @@ class RecordingService : Service() {
             pauseForMicrophoneFailure(id, "Разрешение на микрофон отозвано")
             return
         }
+        store.setCaptureState(id, CaptureState.RECORDING, CaptureActivity.AUTO_SILENCE)
         captureRequested = true
-        acquireWakeLock()
         captureThread = Thread({ captureLoop(id) }, "record-idea-hub-capture").also { it.start() }
     }
 
     private fun captureLoop(id: String) {
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            pauseForMicrophoneFailure(id, "Нет разрешения на запись звука")
-            return
-        }
+        val initial = store.session(id) ?: return
         val minBuffer = AudioRecord.getMinBufferSize(
-            WavChunkWriter.SAMPLE_RATE,
+            AudioProfile.SAMPLE_RATE_HZ,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
         )
@@ -130,75 +157,125 @@ class RecordingService : Service() {
             pauseForMicrophoneFailure(id, "Устройство не предоставило аудиобуфер")
             return
         }
-        val bufferSize = maxOf(minBuffer * 2, 8192)
         val recorder = try {
             AudioRecord.Builder()
                 .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
                 .setAudioFormat(
                     AudioFormat.Builder()
                         .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(WavChunkWriter.SAMPLE_RATE)
+                        .setSampleRate(AudioProfile.SAMPLE_RATE_HZ)
                         .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
                         .build(),
                 )
-                .setBufferSizeInBytes(bufferSize)
+                .setBufferSizeInBytes(maxOf(minBuffer * 2, EfficientVad.FRAME_SAMPLES * 8))
                 .build()
-        } catch (exc: SecurityException) {
-            pauseForMicrophoneFailure(id, "Android запретил доступ к микрофону")
-            return
-        } catch (exc: RuntimeException) {
+        } catch (exc: Exception) {
             pauseForMicrophoneFailure(id, "Не удалось открыть микрофон: ${exc.message}")
             return
         }
         audioRecord = recorder
-        val buffer = ByteArray(bufferSize)
-        var writer = newWriter(id)
-        var silentMs = 0L
-        var lastRuntimeUpdate = 0L
+        val suppressor = if (NoiseSuppressor.isAvailable()) {
+            runCatching { NoiseSuppressor.create(recorder.audioSessionId) }.getOrNull()
+        } else {
+            null
+        }
+        val detector = EfficientVad(initial.capturePolicy == CapturePolicy.VOICE_ACTIVITY_AUTO_PAUSE_V1)
+        val latch = SpeechLatch(attackFrames = 3, hangoverFrames = 60)
+        val preRoll = ArrayDeque<FramePacket>()
+        var writer: M4aChunkWriter? = null
+        var persistedAudioMs = initial.durationMs
+        var activity = if (initial.capturePolicy == CapturePolicy.CONTINUOUS_V1) {
+            CaptureActivity.VOICE
+        } else {
+            CaptureActivity.AUTO_SILENCE
+        }
+        var lastBroadcastActivity: String? = null
+        var lastStoreUpdateWallMs = -1L
+        var silenceStartedWallMs: Long? = null
+        val frame = ShortArray(EfficientVad.FRAME_SAMPLES)
         try {
-            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                throw SecurityException("RECORD_AUDIO permission was revoked")
-            }
             recorder.startRecording()
-            if (recorder.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                throw IllegalStateException("AudioRecord did not enter recording state")
+            check(recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                "AudioRecord did not enter recording state"
             }
             while (captureRequested) {
-                val count = recorder.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
-                if (count == AudioRecord.ERROR_DEAD_OBJECT) {
-                    throw IllegalStateException("Android audio service was restarted")
+                if (!readFrame(recorder, frame)) continue
+                val wallEndMs = elapsedFromStart(initial.startedAt)
+                val wallStartMs = (wallEndMs - EfficientVad.FRAME_MS).coerceAtLeast(0L)
+                val packet = FramePacket(frame.copyOf(), wallStartMs, wallEndMs)
+                val wasActive = latch.active
+                val active = latch.onFrame(detector.isSpeech(packet.samples))
+                if (active) {
+                    silenceStartedWallMs = null
+                    if (!wasActive) {
+                        ensurePreRoll(preRoll, packet)
+                        writer = writer ?: newWriter(id, persistedAudioMs)
+                        while (preRoll.isNotEmpty()) {
+                            val buffered = preRoll.removeFirst()
+                            writer?.writeFrame(buffered.samples, buffered.wallStartMs, buffered.wallEndMs)
+                        }
+                    } else {
+                        writer = writer ?: newWriter(id, persistedAudioMs)
+                        writer?.writeFrame(packet.samples, packet.wallStartMs, packet.wallEndMs)
+                    }
+                    activity = if (detector.isFailOpen) {
+                        CaptureActivity.FALLBACK_CONTINUOUS
+                    } else {
+                        CaptureActivity.VOICE
+                    }
+                    if ((writer?.durationMs ?: 0L) >= M4aChunkWriter.TARGET_SEGMENT_MS) {
+                        persistedAudioMs = persist(writer?.close(), persistedAudioMs)
+                        writer = null
+                    }
+                } else {
+                    ensurePreRoll(preRoll, packet)
+                    if (silenceStartedWallMs == null) silenceStartedWallMs = wallStartMs
+                    activity = CaptureActivity.AUTO_SILENCE
+                    val silenceMs = wallEndMs - (silenceStartedWallMs ?: wallEndMs)
+                    if (
+                        silenceMs >= LONG_SILENCE_CLOSE_MS &&
+                        (writer?.durationMs ?: 0L) >= MIN_DURABLE_SEGMENT_MS
+                    ) {
+                        persistedAudioMs = persist(writer?.close(), persistedAudioMs)
+                        writer = null
+                    }
                 }
-                if (count < 0) {
-                    throw IllegalStateException("AudioRecord read failed: $count")
+
+                val recordedAudioMs = persistedAudioMs + (writer?.durationMs ?: 0L)
+                val currentSession = store.session(id) ?: break
+                val autoSkipped = (
+                    wallEndMs - currentSession.manualPauseMs - recordedAudioMs
+                    ).coerceAtLeast(0L)
+                runtime.update(id, recordedAudioMs, wallEndMs, autoSkipped, activity)
+                if (
+                    lastStoreUpdateWallMs < 0L ||
+                    wallEndMs - lastStoreUpdateWallMs >= STORE_UPDATE_INTERVAL_MS ||
+                    activity != lastBroadcastActivity
+                ) {
+                    store.updateCaptureProgress(
+                        id,
+                        recordedAudioMs,
+                        wallEndMs,
+                        currentSession.manualPauseMs,
+                        autoSkipped,
+                        activity,
+                    )
+                    lastStoreUpdateWallMs = wallEndMs
                 }
-                if (count == 0) continue
-                writer.write(buffer, count)
-                val liveDuration = writer.startMs + writer.durationMs
-                if (liveDuration - lastRuntimeUpdate >= 500L) {
-                    runtime.update(id, liveDuration)
-                    lastRuntimeUpdate = liveDuration
+                if (activity != lastBroadcastActivity) {
+                    updateNotification(activity)
+                    lastBroadcastActivity = activity
+                    broadcast(if (activity == CaptureActivity.FALLBACK_CONTINUOUS) {
+                        "Автопропуск недоступен · записываю всё"
+                    } else {
+                        null
+                    })
                 }
-                val blockMs = count.toLong() * 1000L / (WavChunkWriter.SAMPLE_RATE * 2L)
-                silentMs = if (rms(buffer, count) < SILENCE_RMS) silentMs + blockMs else 0L
-                val shouldRoll = writer.durationMs >= HARD_CHUNK_MS ||
-                    (writer.durationMs >= MIN_CHUNK_MS && silentMs >= SILENCE_WINDOW_MS)
-                if (shouldRoll) {
-                    persist(writer.close())
-                    writer = newWriter(id)
-                    silentMs = 0L
-                }
-            }
-        } catch (exc: SecurityException) {
-            if (captureRequested) {
-                captureRequested = false
-                store.setCaptureState(id, CaptureState.PAUSED)
-                store.setLocalError(id, "Доступ к микрофону отозван; сохранён записанный фрагмент")
-                enterForeground("Нужно разрешение на микрофон", paused = true)
             }
         } catch (exc: Exception) {
             if (captureRequested) {
                 captureRequested = false
-                store.setCaptureState(id, CaptureState.PAUSED)
+                store.beginManualPause(id)
                 store.setLocalError(id, "Ошибка записи: ${exc.message}")
                 enterForeground("Запись остановлена с ошибкой", paused = true)
             }
@@ -206,67 +283,91 @@ class RecordingService : Service() {
             runCatching { recorder.stop() }
             recorder.release()
             audioRecord = null
-            persist(writer.close())
-            releaseWakeLock()
+            suppressor?.release()
+            detector.close()
+            persistedAudioMs = persist(writer?.close(), persistedAudioMs)
+            val finalSession = store.session(id)
+            if (finalSession != null) {
+                val wallElapsed = elapsedFromStart(finalSession.startedAt)
+                val autoSkipped = (
+                    wallElapsed - finalSession.manualPauseMs - persistedAudioMs
+                    ).coerceAtLeast(0L)
+                store.updateCaptureProgress(
+                    id,
+                    persistedAudioMs,
+                    wallElapsed,
+                    finalSession.manualPauseMs,
+                    autoSkipped,
+                    if (captureRequested) activity else CaptureActivity.IDLE,
+                )
+                runtime.update(
+                    id,
+                    persistedAudioMs,
+                    wallElapsed,
+                    autoSkipped,
+                    if (captureRequested) activity else CaptureActivity.IDLE,
+                )
+            }
             broadcast()
         }
     }
 
-    private fun pauseForMicrophoneFailure(id: String, message: String) {
-        captureRequested = false
-        store.setCaptureState(id, CaptureState.PAUSED)
-        store.setLocalError(id, message)
-        enterForeground("Микрофон недоступен", paused = true)
-        releaseWakeLock()
-        broadcast(message)
+    private fun readFrame(recorder: AudioRecord, target: ShortArray): Boolean {
+        var offset = 0
+        while (offset < target.size && captureRequested) {
+            val count = recorder.read(target, offset, target.size - offset, AudioRecord.READ_BLOCKING)
+            if (count == AudioRecord.ERROR_DEAD_OBJECT) {
+                throw IllegalStateException("Android audio service was restarted")
+            }
+            if (count < 0) throw IllegalStateException("AudioRecord read failed: $count")
+            if (count == 0) continue
+            offset += count
+        }
+        return offset == target.size
     }
 
-    private fun newWriter(id: String): WavChunkWriter {
-        val startMs = store.session(id)?.durationMs ?: 0L
-        return WavChunkWriter(
-            directory = audioDirectory,
-            sessionId = id,
-            chunkIndex = store.nextChunkIndex(id),
-            startMs = startMs,
-        )
+    private fun ensurePreRoll(queue: ArrayDeque<FramePacket>, packet: FramePacket) {
+        queue.addLast(packet)
+        while (queue.size > PRE_ROLL_FRAMES) queue.removeFirst()
     }
 
-    private fun persist(chunk: WavChunkWriter.ClosedChunk?) {
-        if (chunk == null) return
+    private fun newWriter(id: String, audioStartMs: Long): M4aChunkWriter = M4aChunkWriter(
+        directory = audioDirectory,
+        sessionId = id,
+        chunkIndex = store.nextChunkIndex(id),
+        audioStartMs = audioStartMs,
+    )
+
+    private fun persist(chunk: M4aChunkWriter.ClosedChunk?, previousAudioMs: Long): Long {
+        if (chunk == null) return previousAudioMs
         store.addChunk(
             sessionId = chunk.sessionId,
             chunkIndex = chunk.chunkIndex,
-            startMs = chunk.startMs,
-            endMs = chunk.endMs,
+            startMs = chunk.audioStartMs,
+            endMs = chunk.audioEndMs,
+            wallStartMs = chunk.wallStartMs,
+            wallEndMs = chunk.wallEndMs,
             path = chunk.file.absolutePath,
             sha256 = chunk.sha256,
+            mimeType = AudioProfile.MIME_M4A,
         )
-        SyncScheduler.enqueue(this)
+        return chunk.audioEndMs
     }
 
     @Synchronized
     private fun stopCapture() {
         captureRequested = false
         runCatching { audioRecord?.stop() }
-        captureThread?.join(5_000)
+        captureThread?.join(10_000)
         captureThread = null
-        releaseWakeLock()
     }
 
-    private fun rms(buffer: ByteArray, count: Int): Double {
-        var sum = 0.0
-        var samples = 0
-        var index = 0
-        while (index + 1 < count) {
-            val sample = (
-                (buffer[index + 1].toInt() shl 8) or
-                    (buffer[index].toInt() and 0xff)
-                ).toShort().toInt()
-            sum += sample.toDouble() * sample.toDouble()
-            samples++
-            index += 2
-        }
-        return if (samples == 0) 0.0 else sqrt(sum / samples)
+    private fun pauseForMicrophoneFailure(id: String, message: String) {
+        captureRequested = false
+        store.beginManualPause(id)
+        store.setLocalError(id, message)
+        enterForeground("Микрофон недоступен", paused = true)
+        broadcast(message)
     }
 
     private fun enterForeground(text: String, paused: Boolean) {
@@ -282,6 +383,17 @@ class RecordingService : Service() {
         }
     }
 
+    private fun updateNotification(activity: String) {
+        val text = when (activity) {
+            CaptureActivity.VOICE -> "Записываю голос"
+            CaptureActivity.AUTO_SILENCE -> "Слушаю · тишина не записывается"
+            CaptureActivity.FALLBACK_CONTINUOUS -> "Автопропуск недоступен · записываю всё"
+            else -> "Запись идёт"
+        }
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, notification(text, paused = false))
+    }
+
     @Suppress("DEPRECATION")
     private fun notification(text: String, paused: Boolean): Notification {
         val toggleAction = if (paused) ACTION_RESUME else ACTION_PAUSE
@@ -293,7 +405,7 @@ class RecordingService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         return Notification.Builder(this, CHANNEL_ID)
-            .setSmallIcon(com.onedayonemasterpiece.recordideahub.R.drawable.ic_mic)
+            .setSmallIcon(R.drawable.ic_mic)
             .setContentTitle("Record Idea Hub")
             .setContentText(text)
             .setContentIntent(openApp)
@@ -311,28 +423,11 @@ class RecordingService : Service() {
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
     )
 
-    private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        val manager = getSystemService(PowerManager::class.java)
-        wakeLock = manager.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "$packageName:voice-capture",
-        ).apply { acquire(WAKE_LOCK_TIMEOUT_MS) }
-    }
-
-    private fun releaseWakeLock() {
-        wakeLock?.let { lock ->
-            if (lock.isHeld) lock.release()
-        }
-        wakeLock = null
-    }
-
     private fun createNotificationChannel() {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(
                 CHANNEL_ID,
-                getString(com.onedayonemasterpiece.recordideahub.R.string.notification_channel),
+                getString(R.string.notification_channel),
                 NotificationManager.IMPORTANCE_LOW,
             ),
         )
@@ -346,13 +441,28 @@ class RecordingService : Service() {
         )
     }
 
+    private fun elapsedFromStart(startedAt: String): Long = runCatching {
+        (System.currentTimeMillis() - OffsetDateTime.parse(startedAt).toInstant().toEpochMilli())
+            .coerceAtLeast(0L)
+    }.getOrDefault(0L)
+
+    private fun elapsedBetween(startedAt: String, endedAt: OffsetDateTime): Long = runCatching {
+        Duration.between(OffsetDateTime.parse(startedAt), endedAt).toMillis().coerceAtLeast(0L)
+    }.getOrDefault(0L)
+
     override fun onDestroy() {
         if (captureRequested) {
             stopCapture()
-            sessionId?.let { store.setCaptureState(it, CaptureState.PAUSED) }
+            sessionId?.let { store.beginManualPause(it) }
         }
         super.onDestroy()
     }
+
+    private data class FramePacket(
+        val samples: ShortArray,
+        val wallStartMs: Long,
+        val wallEndMs: Long,
+    )
 
     companion object {
         const val ACTION_START = "com.onedayonemasterpiece.recordideahub.START"
@@ -364,11 +474,10 @@ class RecordingService : Service() {
         private const val CHANNEL_ID = "record-idea-hub-recording"
         private const val NOTIFICATION_ID = 7001
         private const val MIN_SESSION_MS = 5_000L
-        private const val MIN_CHUNK_MS = 75_000L
-        private const val HARD_CHUNK_MS = 120_000L
-        private const val SILENCE_WINDOW_MS = 600L
-        private const val SILENCE_RMS = 450.0
-        private const val WAKE_LOCK_TIMEOUT_MS = 6 * 60 * 60 * 1000L
+        private const val PRE_ROLL_FRAMES = 30
+        private const val STORE_UPDATE_INTERVAL_MS = 2_000L
+        private const val LONG_SILENCE_CLOSE_MS = 15_000L
+        private const val MIN_DURABLE_SEGMENT_MS = 10_000L
 
         fun command(context: Context, action: String) {
             val intent = Intent(context, RecordingService::class.java).setAction(action)
