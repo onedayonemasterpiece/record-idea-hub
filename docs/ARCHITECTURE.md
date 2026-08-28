@@ -2,56 +2,69 @@
 
 ## Product boundary
 
-One deliberate recording session produces exactly one IdeaHub source packet. Technical chunk boundaries and pause/resume events never create separate Markdown records.
+One deliberately finished recording session produces exactly one IdeaHub source packet. Pause/resume events and technical chunk boundaries never create separate Markdown records.
 
 ```text
-Android AudioRecord
+Samsung Android
+  ├─ AudioRecord foreground service
   ├─ recoverable PCM16/WAV chunks
-  ├─ SQLite delivery ledger
-  └─ WorkManager retry queue
-          │ HTTPS + device token
+  ├─ SQLite: session, chunk and transcript state
+  └─ WorkManager: network and quota retries
+          │ HTTPS + one device token
           ▼
-FastAPI backend + persistent /data
-  ├─ idempotent chunk receipts
-  ├─ events-bot-new GoogleAIClient
-  │    └─ shared Supabase reserve / sent / finalize ledger
-  ├─ Gemini Flash-Lite transcription
-  ├─ Gemini Flash-Lite structured synthesis
-  └─ atomic Git data transaction
+existing my-data-hub control-plane on devstand
+  ├─ validates WAV, SHA-256 and request bounds
+  ├─ shared Supabase limiter
+  │    └─ reserve -> mark_sent -> one Google POST -> finalize
+  ├─ Gemini Flash-Lite chunk transcription
+  ├─ Gemini Flash-Lite structured session synthesis
+  └─ atomic Git Data API transaction + readback
           │
           ▼
 idea-hub/main
+  ├─ inbox/voice/YYYY/MM/<session_id>.md
   ├─ registry/sessions/YYYY/MM/<session_id>.md
   └─ registry/intake-sessions.yaml (overall=open, pending=1)
 ```
 
+## Ownership
+
+The phone is the durable owner of:
+
+- recording and pause/resume state;
+- WAV chunks;
+- per-chunk transcripts returned by the server;
+- retry schedule and quota-wait state;
+- the decision to delete audio after verified publication.
+
+`my-data-hub` is a bounded processing boundary. It does not persist audio, does not introduce a second session database and does not own a queue. Request bytes live only during the HTTP handler.
+
 ## Recording semantics
 
 - PCM 16-bit, 16 kHz, mono, WAV.
-- A chunk closes on a speech pause after 75 seconds or forcibly at 120 seconds.
-- Explicit Pause closes the current chunk; Resume continues the same session timeline.
+- A chunk closes around two minutes of recorded audio or when a useful fragment is closed by an explicit pause.
+- Resume continues the same `session_id` and timeline.
+- Only “Завершить и отправить” closes the logical session.
 - Sessions shorter than five seconds are discarded locally and do not create IdeaHub noise.
-- A `.wav.part` file is repaired and registered after process restart.
+- A closed `.wav.part` is repaired and registered after process restart.
 
-## Shared limiter
+## Google and quota contract
 
-The backend imports the canonical `google_ai` package from a pinned `events-bot-new` commit during the Docker build. It does not copy or reimplement quota logic.
+Only explicitly allowed Gemini Flash-Lite model IDs may be used. A provider request is impossible unless the shared limiter has returned a valid lease. There is no process-local limiter, fail-open path, unaccounted key rotation or hidden post-send retry.
 
-Production enforces:
+A quota refusal is returned as typed HTTP 429 with `retry_after_seconds`. Android records `WAITING_FOR_QUOTA`, keeps all source data and schedules a delayed WorkManager run.
 
-```text
-GOOGLE_AI_ALLOW_RESERVE_FALLBACK=0
-GOOGLE_AI_LOCAL_LIMITER_FALLBACK=0
-GOOGLE_AI_LOCAL_LIMITER_ON_RESERVE_ERROR=0
-```
+## GitHub contract
 
-The configured model must contain `flash-lite`; the MVP default is `gemini-3.1-flash-lite`. Model fallback is disabled per request. The limiter receives distinct consumers for transcription and synthesis.
+The server receives validated structured data, not arbitrary repository paths or arbitrary Markdown. It is hard-bound to `onedayonemasterpiece/idea-hub` and branch `main`.
 
-## Failure contract
+Publication uses the current `main` tree as a base, creates one non-force commit, retries ordinary branch movement and reconciles an unknown network outcome by deterministic `session_id`. The phone receives success only after exact-commit and current-main readback.
 
-At every moment a session is in one of two safe states:
+## Failure invariant
 
-1. its source audio still exists locally/server-side and delivery can resume; or
-2. the exact GitHub commit has been read back and audio may be deleted.
+At every moment one of these states is true:
 
-An HTTP timeout after a GitHub ref update is reconciled by the deterministic `session_id` and detail path. No blind duplicate commit is allowed.
+1. the source WAV and all completed transcripts still exist on the phone and processing can resume; or
+2. the exact IdeaHub publication has been read back and local WAV files may be deleted.
+
+A generic spinner, HTTP timeout or process restart is never treated as proof of success.

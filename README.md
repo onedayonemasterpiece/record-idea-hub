@@ -1,39 +1,44 @@
 # Record Idea Hub
 
-Однокнопочный Android‑inbox для голосовых идей и review-сессий с надёжной доставкой в [`onedayonemasterpiece/idea-hub`](https://github.com/onedayonemasterpiece/idea-hub).
+Однокнопочный Android-inbox для голосовых идей и review-сессий с надёжной доставкой в [`onedayonemasterpiece/idea-hub`](https://github.com/onedayonemasterpiece/idea-hub).
 
-## Что делает MVP
+## Продуктовый сценарий
 
-1. Записывает одну логическую сессию с паузой и продолжением.
-2. Локально сохраняет восстанавливаемые WAV-чанки и отправляет закрытые чанки во время записи.
-3. Распознаёт каждый чанк и делает подробную итоговую выжимку одной моделью Gemini Flash‑Lite.
-4. Все вызовы Gemini проходят через общий онлайн-limiter из `events-bot-new`; обход limiter в production запрещён.
-5. Атомарно создаёт один Markdown source packet и открытую `pending`-запись в `idea-hub/registry/intake-sessions.yaml`.
-6. Считает доставку успешной только после GitHub readback точного commit.
-7. После подтверждения удаляет аудио и на телефоне, и на backend.
+1. Нажать большую кнопку и начать запись.
+2. Поставить запись на паузу и продолжить ту же логическую сессию любое число раз.
+3. Закрытые WAV-чанки остаются на телефоне и последовательно отправляются в `my-data-hub` на devstand.
+4. `my-data-hub` проводит каждый запрос Gemini Flash-Lite через общий онлайн-limiter и возвращает структурированную расшифровку.
+5. Телефон сохраняет расшифровку локально. После явного завершения `my-data-hub` делает одну подробную выжимку и один атомарный commit в `idea-hub/main`.
+6. Успех показывается только после GitHub readback. Затем приложение удаляет локальные WAV-чанки.
 
-## Структура
+Технические чанки и паузы не создают отдельные Markdown-файлы: одна завершённая пользовательская сессия всегда даёт одну новую pending-запись IdeaHub.
 
-- `android/` — лаконичное приложение для Samsung S21 Ultra и других Android 10+ устройств.
-- `backend/` — приём чанков, Gemini Lite, shared limiter, Markdown и GitHub transaction.
-- `docs/` — архитектура, контракт IdeaHub, acceptance и handoff для установки через ADB.
+## Граница компонентов
 
-## Быстрая проверка backend
+- `android/` — запись, foreground service, пауза/продолжение, SQLite, WorkManager, локальные транскрипции, retry и лаконичный прогресс.
+- `my-data-hub` — существующий devstand control-plane: прокси Gemini Lite, общий limiter, итоговый synthesis, GitHub transaction и readback.
+- `idea-hub` — каноническое хранилище необработанной записи и authoritative intake registry.
 
-```bash
-cd backend
-python -m pip install -e '.[dev]'
-pytest
-```
-
-Сборка APK выполняется GitHub Actions. Ключи Gemini, Supabase limiter и GitHub никогда не попадают в APK или публичный репозиторий.
+В этом репозитории нет отдельного backend, Fly-приложения, серверной БД или очереди. Ключи Google, Supabase limiter и GitHub никогда не попадают в APK.
 
 ## Сборка Android
 
-GitHub Actions запускает тесты и публикует artifact `record-idea-hub-debug-apk`. Локальный эквивалент при установленном Gradle 8.13 и Android SDK 36:
+GitHub Actions выполняет lint, unit tests и сборку installable debug APK. Artifact называется:
 
-```bash
-gradle -p android testDebugUnitTest assembleDebug
+```text
+record-idea-hub-debug-apk
 ```
 
-Аппаратная установка и проверка описаны в `docs/ADB_HANDOFF.md`.
+Локальный эквивалент при установленном Gradle 8.13 и Android SDK 36:
+
+```bash
+gradle -p android --no-daemon lintDebug testDebugUnitTest assembleDebug
+```
+
+## Эксплуатационные документы
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — продуктовая и техническая граница.
+- [`docs/MY_DATA_HUB_INTEGRATION.md`](docs/MY_DATA_HUB_INTEGRATION.md) — серверный контракт devstand.
+- [`docs/IDEA_HUB_CONTRACT.md`](docs/IDEA_HUB_CONTRACT.md) — атомарная регистрация новой записи.
+- [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) — критерии готовности.
+- [`docs/ADB_HANDOFF.md`](docs/ADB_HANDOFF.md) — установка и физическая проверка Samsung S21 Ultra через OpenCode.
