@@ -351,7 +351,11 @@ class MainActivity : Activity() {
     }
 
     private fun processLabel(session: SessionSnapshot): String = when (session.remoteState) {
-        RemoteState.LOCAL_ONLY -> "my-data-hub  ○ ожидает передачу"
+        RemoteState.LOCAL_ONLY -> if (config.isConfigured()) {
+            "my-data-hub  ○ ожидает передачу"
+        } else {
+            "Локально          ✓ настройте my-data-hub для отправки"
+        }
         RemoteState.RECEIVING -> "my-data-hub  ● принимает сессию"
         RemoteState.PROCESSING -> "Gemini Lite    ● распознаёт"
         RemoteState.PUBLISHING -> "IdeaHub           ● commit и readback"
@@ -398,12 +402,6 @@ class MainActivity : Activity() {
     }
 
     private fun ensureReadyAnd(action: String) {
-        if (!config.isConfigured()) {
-            pendingStart = action == RecordingService.ACTION_START ||
-                action == RecordingService.ACTION_RESUME
-            showSettings()
-            return
-        }
         val permissions = mutableListOf(Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= 33) permissions += Manifest.permission.POST_NOTIFICATIONS
         val missing = permissions.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
@@ -411,7 +409,18 @@ class MainActivity : Activity() {
             pendingStart = true
             requestPermissions(missing.toTypedArray(), REQUEST_PERMISSIONS)
         } else {
-            RecordingService.command(this, action)
+            startLocalCapture(action)
+        }
+    }
+
+    private fun startLocalCapture(action: String) {
+        RecordingService.command(this, action)
+        if (!config.isConfigured()) {
+            Toast.makeText(
+                this,
+                "Запись идёт локально. Настройте my-data-hub позже для отправки.",
+                Toast.LENGTH_LONG,
+            ).show()
         }
     }
 
@@ -432,7 +441,7 @@ class MainActivity : Activity() {
             } else {
                 RecordingService.ACTION_START
             }
-            RecordingService.command(this, action)
+            startLocalCapture(action)
         }
     }
 
@@ -474,39 +483,51 @@ class MainActivity : Activity() {
                 if (token.text.isNotBlank()) config.deviceToken = token.text.toString()
                 if (!config.isConfigured()) {
                     Toast.makeText(this, "Укажите URL devstand и device token", Toast.LENGTH_LONG).show()
-                } else if (pendingStart) {
-                    pendingStart = false
-                    ensureReadyAnd(
-                        if (store.activeSession()?.captureState == CaptureState.PAUSED) {
-                            RecordingService.ACTION_RESUME
-                        } else {
-                            RecordingService.ACTION_START
-                        },
-                    )
+                } else {
+                    SyncScheduler.enqueue(this)
                 }
             }
             .show()
     }
 
     private fun validServerUrl(value: String): Boolean {
-        if (value.startsWith("https://")) return true
-        return BuildConfig.DEBUG && (
-            value.startsWith("http://127.0.0.1") ||
-                value.startsWith("http://localhost")
-            )
+        val parsed = runCatching { Uri.parse(value) }.getOrNull() ?: return false
+        val scheme = parsed.scheme?.lowercase() ?: return false
+        val host = parsed.host?.lowercase()?.takeIf { it.isNotBlank() } ?: return false
+        if (scheme == "https") return true
+        return BuildConfig.DEBUG && scheme == "http" && host in setOf("127.0.0.1", "localhost")
     }
 
+    private fun validDeviceToken(value: String): Boolean =
+        value.length in 32..256 && value.all { it.code >= 33 && !it.isWhitespace() }
+
     private fun consumeProvisioningIntent(intent: Intent) {
-        val server = intent.getStringExtra(EXTRA_SERVER_URL)
+        if (!BuildConfig.DEBUG) return
+        val rawServer = intent.getStringExtra(EXTRA_SERVER_URL)
             ?: intent.getStringExtra(EXTRA_BACKEND_URL)
-        val token = intent.getStringExtra(EXTRA_DEVICE_TOKEN)
-        if (!server.isNullOrBlank()) config.backendUrl = server
-        if (!token.isNullOrBlank()) config.deviceToken = token
-        if (!server.isNullOrBlank() || !token.isNullOrBlank()) {
+        val rawToken = intent.getStringExtra(EXTRA_DEVICE_TOKEN)
+        val server = rawServer?.trim()?.trimEnd('/')
+        val token = rawToken?.trim()
+        var applied = false
+        if (!server.isNullOrBlank() && validServerUrl(server)) {
+            config.backendUrl = server
+            applied = true
+        }
+        if (!token.isNullOrBlank() && validDeviceToken(token)) {
+            config.deviceToken = token
+            applied = true
+        }
+        val hadProvisioningExtras = rawServer != null || rawToken != null
+        if (hadProvisioningExtras) {
             intent.removeExtra(EXTRA_SERVER_URL)
             intent.removeExtra(EXTRA_BACKEND_URL)
             intent.removeExtra(EXTRA_DEVICE_TOKEN)
+        }
+        if (applied) {
+            SyncScheduler.enqueue(this)
             Toast.makeText(this, "my-data-hub настроен через ADB", Toast.LENGTH_SHORT).show()
+        } else if (hadProvisioningExtras) {
+            Toast.makeText(this, "ADB-настройка отклонена: проверьте URL и token", Toast.LENGTH_LONG).show()
         }
     }
 
