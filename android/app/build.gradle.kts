@@ -18,6 +18,12 @@ android {
     }
 
     buildTypes {
+        debug {
+            // GitHub-hosted runners generate a different default debug certificate per run.
+            // A distinct beta package lets OpenCode install Android 1.1 alongside the working
+            // v1 APK without uninstalling it or risking the urgent review workflow.
+            applicationIdSuffix = ".v11"
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
