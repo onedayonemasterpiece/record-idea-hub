@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<lint>
+    <!--
+      MainActivity uses the API 33+ RECEIVER_NOT_EXPORTED overload and falls back
+      to the only available overload on Android 10–12. The package-scoped sender
+      prevents external delivery on those releases. Android lint does not prove
+      this version split, so suppress only this one compatibility call.
+    -->
+    <issue id="UnspecifiedRegisterReceiverFlag">
+        <ignore path="src/main/java/com/onedayonemasterpiece/recordideahub/MainActivity.kt" />
+    </issue>
+</lint>

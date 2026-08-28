@@ -1,0 +1,26 @@
+# Android
+.gradle/
+**/build/
+local.properties
+*.apk
+*.aab
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# Runtime data and secrets
+.env
+.env.*
+!.env.example
+/data/
+*.sqlite3
+*.wav
+*.wav.part
+
+# Editors / OS
+.idea/
+.DS_Store
