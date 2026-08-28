@@ -5,6 +5,7 @@ import com.konovalov.vad.webrtc.config.FrameSize
 import com.konovalov.vad.webrtc.config.Mode
 import com.konovalov.vad.webrtc.config.SampleRate
 import java.io.Closeable
+import kotlin.math.max
 import kotlin.math.sqrt
 
 class EfficientVad(private val enabled: Boolean) : Closeable {
@@ -21,8 +22,8 @@ class EfficientVad(private val enabled: Boolean) : Closeable {
     } else {
         null
     }
+    private val energyGate = AdaptiveEnergyGate()
     private var failedOpen = enabled && detector == null
-    private var noiseFloorRms = 80.0
 
     val isFailOpen: Boolean
         get() = failedOpen
@@ -30,17 +31,11 @@ class EfficientVad(private val enabled: Boolean) : Closeable {
     fun isSpeech(frame: ShortArray): Boolean {
         if (!enabled || failedOpen) return true
         val activeDetector = detector ?: return true
-        val rms = rms(frame)
-
-        // Skip JNI only for near-digital silence. WebRTC VAD is deliberately still called for
-        // quiet acoustic frames so an energy threshold cannot clip soft speech beginnings.
-        if (rms <= DIGITAL_SILENCE_RMS) {
-            updateNoiseFloor(rms)
-            return false
-        }
+        val rms = frameRms(frame)
+        if (!energyGate.shouldRunVad(rms)) return false
         return try {
             activeDetector.isSpeech(frame).also { speech ->
-                if (!speech) updateNoiseFloor(rms)
+                energyGate.observeVadResult(rms, speech)
             }
         } catch (_: Throwable) {
             failedOpen = true
@@ -48,21 +43,6 @@ class EfficientVad(private val enabled: Boolean) : Closeable {
             detector = null
             true
         }
-    }
-
-    private fun updateNoiseFloor(value: Double) {
-        val bounded = value.coerceAtMost(noiseFloorRms * 3.0 + 200.0)
-        noiseFloorRms = noiseFloorRms * 0.995 + bounded * 0.005
-    }
-
-    private fun rms(frame: ShortArray): Double {
-        if (frame.isEmpty()) return 0.0
-        var sum = 0.0
-        for (sample in frame) {
-            val value = sample.toDouble()
-            sum += value * value
-        }
-        return sqrt(sum / frame.size)
     }
 
     override fun close() {
@@ -77,6 +57,62 @@ class EfficientVad(private val enabled: Boolean) : Closeable {
         const val MODE = 1
         const val FRAME_SAMPLES = 480
         const val FRAME_MS = 30L
-        private const val DIGITAL_SILENCE_RMS = 20.0
     }
+}
+
+internal class AdaptiveEnergyGate(
+    initialNoiseFloorRms: Double = 80.0,
+    private val thresholdMultiplier: Double = 1.18,
+    private val absoluteMarginRms: Double = 12.0,
+    private val probeEveryFrames: Int = 5,
+    private val digitalSilenceRms: Double = 20.0,
+) {
+    init {
+        require(initialNoiseFloorRms >= 0.0)
+        require(thresholdMultiplier >= 1.0)
+        require(absoluteMarginRms >= 0.0)
+        require(probeEveryFrames >= 1)
+        require(digitalSilenceRms >= 0.0)
+    }
+
+    var noiseFloorRms: Double = initialNoiseFloorRms
+        private set
+    private var frameCounter = 0L
+
+    fun shouldRunVad(rms: Double): Boolean {
+        frameCounter++
+        if (rms <= digitalSilenceRms) {
+            observeNonSpeech(rms)
+            return false
+        }
+        val threshold = max(
+            noiseFloorRms * thresholdMultiplier,
+            noiseFloorRms + absoluteMarginRms,
+        )
+        val periodicProbe = frameCounter % probeEveryFrames == 0L
+        if (rms < threshold && !periodicProbe) {
+            observeNonSpeech(rms)
+            return false
+        }
+        return true
+    }
+
+    fun observeVadResult(rms: Double, speech: Boolean) {
+        if (!speech) observeNonSpeech(rms)
+    }
+
+    private fun observeNonSpeech(rms: Double) {
+        val bounded = rms.coerceIn(0.0, noiseFloorRms * 3.0 + 200.0)
+        noiseFloorRms = noiseFloorRms * 0.995 + bounded * 0.005
+    }
+}
+
+internal fun frameRms(frame: ShortArray): Double {
+    if (frame.isEmpty()) return 0.0
+    var sum = 0.0
+    for (sample in frame) {
+        val value = sample.toDouble()
+        sum += value * value
+    }
+    return sqrt(sum / frame.size)
 }
