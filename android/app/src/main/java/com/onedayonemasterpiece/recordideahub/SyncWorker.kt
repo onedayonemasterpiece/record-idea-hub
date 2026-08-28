@@ -16,19 +16,21 @@ import java.util.concurrent.TimeUnit
 object SyncScheduler {
     private const val UNIQUE_WORK = "record-idea-hub-sync"
 
-    fun enqueue(context: Context) {
-        val request = OneTimeWorkRequestBuilder<SyncWorker>()
+    fun enqueue(context: Context, delaySeconds: Long = 0L) {
+        val builder = OneTimeWorkRequestBuilder<SyncWorker>()
             .setConstraints(
                 Constraints.Builder()
                     .setRequiredNetworkType(NetworkType.CONNECTED)
                     .build(),
             )
             .setBackoffCriteria(BackoffPolicy.LINEAR, 10, TimeUnit.SECONDS)
-            .build()
+        if (delaySeconds > 0L) {
+            builder.setInitialDelay(delaySeconds, TimeUnit.SECONDS)
+        }
         WorkManager.getInstance(context).enqueueUniqueWork(
             UNIQUE_WORK,
             ExistingWorkPolicy.APPEND_OR_REPLACE,
-            request,
+            builder.build(),
         )
     }
 }
@@ -39,47 +41,91 @@ class SyncWorker(
 ) : CoroutineWorker(appContext, parameters) {
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val config = AppGraph.config(applicationContext)
-        val backendUrl = config.backendUrl
+        val serverUrl = config.backendUrl
         val deviceToken = config.deviceToken
-        if (backendUrl.isNullOrBlank() || deviceToken.isNullOrBlank()) return@withContext Result.success()
+        if (serverUrl.isNullOrBlank() || deviceToken.isNullOrBlank()) {
+            return@withContext Result.success()
+        }
 
         val store = AppGraph.store(applicationContext)
-        val api = ApiClient(backendUrl, deviceToken)
-        var waitingForFinalResult = false
+        val api = ApiClient(serverUrl, deviceToken)
         var currentSessionId: String? = null
         try {
             store.deleteAllVerifiedAudio()
             for (session in store.sessionsNeedingSync()) {
                 currentSessionId = session.sessionId
-                var progress = api.createSession(session)
-                store.updateRemoteProgress(session.sessionId, progress)
+
+                if (session.captureState == CaptureState.FINISHED) {
+                    val reconciled = api.status(session.sessionId)
+                    store.updateRemoteProgress(session.sessionId, reconciled)
+                    if (reconciled.githubVerified) {
+                        store.deleteVerifiedAudio(session.sessionId)
+                        continue
+                    }
+                }
 
                 for (chunk in store.chunks(session.sessionId, pendingOnly = true)) {
-                    api.uploadChunk(chunk)
-                    store.markChunkUploaded(session.sessionId, chunk.chunkIndex)
+                    store.setRemoteState(session.sessionId, RemoteState.PROCESSING)
+                    val transcript = api.uploadChunk(chunk)
+                    store.saveChunkTranscript(session.sessionId, chunk.chunkIndex, transcript)
                 }
 
                 val refreshed = store.session(session.sessionId) ?: continue
-                progress = if (refreshed.captureState == CaptureState.FINISHED) {
-                    if (refreshed.chunkCount <= 0) continue
-                    api.completeSession(refreshed)
-                } else {
-                    api.status(refreshed.sessionId)
-                }
-                store.updateRemoteProgress(refreshed.sessionId, progress)
+                if (refreshed.captureState != CaptureState.FINISHED) continue
+                if (refreshed.chunkCount <= 0) continue
 
+                val chunks = store.chunks(refreshed.sessionId)
+                check(chunks.size == refreshed.chunkCount) {
+                    "local session chunk count changed before publication"
+                }
+                if (chunks.any { !it.transcribed }) {
+                    SyncScheduler.enqueue(applicationContext, 10L)
+                    continue
+                }
+
+                store.setRemoteState(refreshed.sessionId, RemoteState.PUBLISHING)
+                val progress = api.completeSession(refreshed, chunks)
+                store.updateRemoteProgress(refreshed.sessionId, progress)
                 if (progress.githubVerified) {
                     store.deleteVerifiedAudio(refreshed.sessionId)
-                } else if (refreshed.captureState == CaptureState.FINISHED) {
-                    waitingForFinalResult = true
+                } else {
+                    SyncScheduler.enqueue(applicationContext, 15L)
                 }
             }
-            if (waitingForFinalResult) Result.retry() else Result.success()
+            Result.success()
         } catch (exc: ApiException) {
-            currentSessionId?.let { store.setLocalError(it, exc.message) }
-            if (exc.retryable) Result.retry() else Result.failure()
+            val sessionId = currentSessionId
+            if (sessionId != null) {
+                if (exc.retryable) {
+                    val delay = (exc.retryAfterSeconds ?: if (exc.reconciliationRequired) 15 else 30)
+                        .coerceIn(1, 86_400)
+                    if (exc.code == "provider_429" || exc.code.startsWith("quota_exhausted_")) {
+                        store.setQuotaWait(
+                            sessionId,
+                            delay,
+                            exc.message ?: "Ожидание доступного лимита Gemini",
+                        )
+                    } else {
+                        store.setRemoteState(
+                            sessionId,
+                            RemoteState.RETRYABLE_ERROR,
+                            exc.message,
+                        )
+                    }
+                    SyncScheduler.enqueue(applicationContext, delay.toLong())
+                } else {
+                    store.setRemoteState(sessionId, RemoteState.RETRYABLE_ERROR, exc.message)
+                }
+            }
+            if (exc.retryable) Result.success() else Result.failure()
         } catch (exc: Exception) {
-            currentSessionId?.let { store.setLocalError(it, exc.message) }
+            currentSessionId?.let { sessionId ->
+                store.setRemoteState(
+                    sessionId,
+                    RemoteState.RETRYABLE_ERROR,
+                    exc.message ?: "Локальная очередь сохранена; повтор будет выполнен автоматически",
+                )
+            }
             Result.retry()
         }
     }
