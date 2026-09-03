@@ -51,6 +51,10 @@ The phone is the durable owner of:
 - Detector: conservative energy gate followed by lightweight native WebRTC VAD; any detector failure is fail-open continuous recording.
 - A RAM pre-roll and speech hangover protect phrase boundaries.
 - A durable segment normally closes around three minutes of actually recorded audio, at manual pause or at explicit finish.
+- Audio ranges across segments are exactly contiguous. Wall-clock ranges may
+  overlap by at most 50 ms because a blocking `AudioRecord` read can deliver
+  adjacent 30 ms frames faster than wall-clock sampling; this bounded jitter
+  never changes audio order or duration.
 - Only `Завершить и отправить` closes the logical session.
 - Sessions shorter than the local minimum are discarded without creating IdeaHub noise.
 

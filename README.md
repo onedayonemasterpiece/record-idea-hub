@@ -62,7 +62,7 @@ assembleDebug
 Текущий artifact workflow:
 
 ```text
-record-idea-hub-1.1-rc2-apk
+record-idea-hub-1.1-rc3-apk
 ```
 
 Локальный эквивалент при Gradle 8.13 и Android SDK 36:
@@ -73,7 +73,13 @@ gradle -p android --no-daemon lintDebug testDebugUnitTest assembleDebug
 
 ## Статус
 
-Рабочий цикл Android 1.1 принят на Samsung S21 Ultra и слит в `main`. Зафиксированные неблокирующие наблюдения — частичное обрезание оранжевого маркера одной OEM-маской launcher и нефатальное сообщение Samsung `MPEG4Writer` при валидном M4A — отложены до отдельной будущей доработки, если она понадобится.
+Рабочий цикл Android 1.1 принят на Samsung S21 Ultra и слит в `main`. После
+инцидента 2026-09-03 клиент допускает только ограниченный 50 ms wall-clock
+jitter между соседними сегментами, сохраняя строго непрерывный audio timeline.
+Зафиксированные неблокирующие наблюдения — частичное обрезание оранжевого
+маркера одной OEM-маской launcher и нефатальное сообщение Samsung
+`MPEG4Writer` при валидном M4A — отложены до отдельной будущей доработки, если
+она понадобится.
 
 ## Документация
 

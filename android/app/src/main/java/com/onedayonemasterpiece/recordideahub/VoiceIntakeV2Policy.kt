@@ -3,6 +3,8 @@ package com.onedayonemasterpiece.recordideahub
 import kotlin.math.ceil
 
 internal object VoiceIntakeV2Policy {
+    const val WALL_TIMELINE_OVERLAP_TOLERANCE_MS = 50L
+
     private val manualReconciliationCodes = setOf(
         "session_metadata_conflict",
         "chunk_conflict",
@@ -65,6 +67,9 @@ internal object VoiceIntakeV2Policy {
 
     fun retryDelaySeconds(retryAfterSeconds: Int?, fallbackSeconds: Long): Long =
         retryAfterSeconds?.takeIf { it > 0 }?.toLong() ?: fallbackSeconds.coerceAtLeast(1L)
+
+    fun wallTimelineFollows(previousEndMs: Long, currentStartMs: Long): Boolean =
+        currentStartMs + WALL_TIMELINE_OVERLAP_TOLERANCE_MS >= previousEndMs
 
     fun normalizeServiceBaseUrl(value: String): String {
         val trimmed = value.trim().trimEnd('/')
