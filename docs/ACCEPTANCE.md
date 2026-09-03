@@ -12,7 +12,7 @@ One deliberately completed voice session, including any number of manual pauses,
 - Local SQLite/segment state survives UI recreation and network loss.
 - Every synchronization pass begins with idempotent server create/re-open.
 - The APK contains no Google, Supabase or GitHub credentials.
-- The accepted side-by-side build is version `1.1.0-rc2`, package `com.onedayonemasterpiece.recordideahub.v11`.
+- The accepted side-by-side build was version `1.1.0-rc2`, package `com.onedayonemasterpiece.recordideahub.v11`; the 2026-09-03 correction is `1.1.0-rc3` with the same package.
 
 ## my-data-hub gates — completed
 
@@ -63,3 +63,12 @@ CURRENT IMPLEMENTATION CYCLE CLOSED
 ```
 
 Future refinements or confirmed defects should be handled through a new focused issue/PR rather than reopening the completed implementation batch.
+
+## 2026-09-03 focused correction
+
+Session `voice-20260903-204457-368264f8` exposed a 7 ms overlap between
+adjacent wall-clock segment ranges while its audio ranges remained exactly
+contiguous. The client now accepts only bounded overlap through 50 ms, matching
+the server contract; 51 ms and larger still fail closed. The affected audio
+remained durable and requires terminal server/GitHub recovery evidence before
+this correction is considered released.

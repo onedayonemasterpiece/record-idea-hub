@@ -304,7 +304,12 @@ private fun requireOrderedChunks(session: SessionSnapshot, chunks: List<ChunkRec
             }
             ordered.zipWithNext().forEach { (previous, current) ->
                 require(current.startMs == previous.endMs) { "audio timeline must be contiguous" }
-                require(current.wallStartMs >= previous.wallEndMs) { "wall timeline must not overlap" }
+                require(
+                    VoiceIntakeV2Policy.wallTimelineFollows(
+                        previous.wallEndMs,
+                        current.wallStartMs,
+                    ),
+                ) { "wall timeline overlap exceeds capture-clock tolerance" }
             }
             require(ordered.last().endMs == session.durationMs) {
                 "audio timeline must match recorded duration"

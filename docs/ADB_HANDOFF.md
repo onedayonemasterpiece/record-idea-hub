@@ -17,7 +17,7 @@ com.onedayonemasterpiece.recordideahub.v11
 Use the latest successful `Android CI and APK` run on `main`. The current workflow artifact is:
 
 ```text
-record-idea-hub-1.1-rc2-apk
+record-idea-hub-1.1-rc3-apk
 ```
 
 Example:
@@ -27,7 +27,7 @@ REPO=onedayonemasterpiece/record-idea-hub
 RUN_ID="$(gh run list -R "$REPO" --workflow ci.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
 rm -rf .tmp-record-idea-apk
 mkdir -p .tmp-record-idea-apk
-gh run download -R "$REPO" "$RUN_ID" -n record-idea-hub-1.1-rc2-apk -D .tmp-record-idea-apk
+gh run download -R "$REPO" "$RUN_ID" -n record-idea-hub-1.1-rc3-apk -D .tmp-record-idea-apk
 APK="$(find .tmp-record-idea-apk -name '*.apk' -type f -print -quit)"
 test -f "$APK"
 sha256sum "$APK"

@@ -70,6 +70,13 @@ class VoiceIntakeV2PolicyTest {
         assertEquals(45L, VoiceIntakeV2Policy.retryDelaySeconds(45, 60L))
     }
 
+    @Test
+    fun acceptsOnlyBoundedCaptureClockOverlapBetweenSegments() {
+        assertTrue(VoiceIntakeV2Policy.wallTimelineFollows(180_758L, 180_751L))
+        assertTrue(VoiceIntakeV2Policy.wallTimelineFollows(180_758L, 180_708L))
+        assertFalse(VoiceIntakeV2Policy.wallTimelineFollows(180_758L, 180_707L))
+    }
+
     private fun progress(
         retryable: Boolean,
         retryAfterSeconds: Int?,
