@@ -1,9 +1,13 @@
 package com.onedayonemasterpiece.recordideahub
 
 import android.app.Application
-import com.sun.net.httpserver.HttpServer
 import java.io.File
-import java.net.InetSocketAddress
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.SocketException
+import java.io.BufferedInputStream
+import java.io.ByteArrayOutputStream
+import kotlin.concurrent.thread
 import java.util.concurrent.CopyOnWriteArrayList
 import org.json.JSONObject
 import org.junit.After
@@ -21,7 +25,8 @@ import org.robolectric.annotation.Config
 class SyncEngineReadbackTest {
     private val context get() = RuntimeEnvironment.getApplication()
     private lateinit var store: SessionStore
-    private lateinit var server: HttpServer
+    private lateinit var server: ServerSocket
+    private lateinit var serverThread: Thread
     private lateinit var audio: List<File>
     private val requests = CopyOnWriteArrayList<String>()
     private val id = "voice-20260905-120000-abcdef12"
@@ -45,29 +50,59 @@ class SyncEngineReadbackTest {
         store.markServerInitialized(id)
         store.markCompleteSent(id)
         store.setRetryableError(id, 1, "old masked error")
-        server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
-        server.createContext("/") { exchange ->
-            exchange.requestBody.use { it.readBytes() }
-            requests.add("${exchange.requestMethod} ${exchange.requestURI.path}")
-            val bytes = replyBody.toByteArray(Charsets.UTF_8)
-            exchange.responseHeaders.set("Content-Type", "application/json; charset=utf-8")
-            exchange.responseHeaders.set("Connection", "close")
-            exchange.sendResponseHeaders(replyCode, bytes.size.toLong())
-            exchange.responseBody.use { it.write(bytes) }
-            exchange.close()
+        server = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
+        serverThread = thread(isDaemon = true, name = "readback-http-fixture") {
+            while (!server.isClosed) {
+                val socket = try { server.accept() } catch (_: SocketException) { break }
+                socket.use {
+                    it.soTimeout = 5000
+                    val input = BufferedInputStream(it.getInputStream())
+                    val first = httpLine(input)
+                    var length = 0
+                    while (true) {
+                        val header = httpLine(input)
+                        if (header.isEmpty()) break
+                        if (header.startsWith("Content-Length:", ignoreCase = true)) {
+                            length = header.substringAfter(':').trim().toInt()
+                        }
+                    }
+                    repeat(length) { check(input.read() >= 0) }
+                    requests.add(first.substringBeforeLast(' '))
+                    val bytes = replyBody.toByteArray(Charsets.UTF_8)
+                    val response = "HTTP/1.1 $replyCode Fixture\r\n" +
+                        "Content-Type: application/json; charset=utf-8\r\n" +
+                        "Content-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
+                    it.getOutputStream().apply {
+                        write(response.toByteArray(Charsets.US_ASCII))
+                        write(bytes)
+                        flush()
+                    }
+                }
+            }
         }
-        server.start()
         replyBody = progress().toString()
     }
 
     @After fun teardown() {
-        server.stop(0)
+        server.close()
+        serverThread.join(1000)
         store.close()
         audio.forEach { it.delete() }
     }
 
+    private fun httpLine(input: BufferedInputStream): String {
+        val bytes = ByteArrayOutputStream()
+        while (true) {
+            val byte = input.read()
+            check(byte >= 0) { "fixture peer disconnected" }
+            if (byte == 10) return bytes.toString("UTF-8").removeSuffix("\r")
+            check(bytes.size() < 8192) { "fixture header too large" }
+            bytes.write(byte)
+        }
+    }
+
     private fun runSync(): Long? = SyncEngine(context, TransferCancellation()).run(
-        id, store, "http://127.0.0.1:${server.address.port}", "non-secret-fixture", userInitiated = true,
+        id, store, "http://127.0.0.1:${server.localPort}", "non-secret-fixture", userInitiated = true,
     )
 
     private fun reopen() { store.close(); store = SessionStore(context) }
