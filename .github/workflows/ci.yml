@@ -53,12 +53,32 @@ jobs:
         run: |
           mkdir -p artifacts
           cp android/app/build/outputs/apk/debug/app-debug.apk \
-            artifacts/record-idea-hub-1.1.0-rc3-debug.apk
-          (cd artifacts && sha256sum record-idea-hub-1.1.0-rc3-debug.apk > SHA256SUMS.txt)
-      - name: Upload installable Android 1.1 RC3 APK
+            artifacts/record-idea-hub-1.1.0-rc4-debug.apk
+          (cd artifacts && sha256sum record-idea-hub-1.1.0-rc4-debug.apk > SHA256SUMS.txt)
+          git rev-parse HEAD > artifacts/SOURCE_SHA.txt
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          "$SDK_ROOT/build-tools/36.0.0/apksigner" verify --print-certs \
+            artifacts/record-idea-hub-1.1.0-rc4-debug.apk > artifacts/SIGNING-CERTIFICATE.txt
+      - name: Upload installable Android 1.1 RC4 APK
         uses: actions/upload-artifact@v7
         with:
-          name: record-idea-hub-1.1-rc3-apk
+          name: record-idea-hub-1.1-rc4-apk
           path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Prepare verification evidence
+        if: always()
+        run: |
+          mkdir -p verification
+          git rev-parse HEAD > verification/SOURCE_SHA.txt
+          git archive --format=tar HEAD > verification/source.tar
+          if [ -d android/app/build/reports ]; then cp -r android/app/build/reports verification/; fi
+          if [ -d android/app/build/test-results ]; then cp -r android/app/build/test-results verification/; fi
+      - name: Upload verification reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: record-idea-hub-verification
+          path: verification/
           if-no-files-found: error
           retention-days: 14
