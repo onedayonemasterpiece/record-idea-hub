@@ -17,7 +17,18 @@ internal class SyncEngine(
         val config = AppGraph.config(context)
         val url = config.backendUrl ?: return null
         val token = config.deviceToken ?: return null
-        val store = AppGraph.store(context)
+        return run(sessionId, AppGraph.store(context), url, token, userInitiated)
+    }
+
+    // The real engine with explicit dependencies: tests replace only the HTTP peer and use SQLite.
+    internal fun run(
+        sessionId: String,
+        store: SessionStore,
+        url: String,
+        token: String,
+        userInitiated: Boolean = false,
+    ): Long? {
+        nextDelay = null
         val session = store.session(sessionId) ?: return null
         if (session.captureState != CaptureState.FINISHED && session.captureState != CaptureState.PAUSED) return null
         val due = session.retryAtEpochMs?.let { VoiceIntakeV2Policy.delaySecondsUntil(it) } ?: 0L

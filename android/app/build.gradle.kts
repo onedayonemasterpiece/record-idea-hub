@@ -23,6 +23,10 @@ android {
             // A distinct beta package lets OpenCode install Android 1.1 alongside the working
             // v1 APK without uninstalling it or risking the urgent review workflow.
             applicationIdSuffix = ".v11"
+            // Evidence builds must not invent another incompatible Android debug identity.
+            if (providers.gradleProperty("unsignedEvidence").orNull == "true") {
+                signingConfig = null
+            }
         }
         release {
             isMinifyEnabled = false
