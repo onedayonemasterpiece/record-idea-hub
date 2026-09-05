@@ -212,6 +212,26 @@ class SyncEngineReadbackTest {
         assertReadOnly()
     }
 
+    @Test fun acceptedCompleteStillHonorsQuotaWaitOnUserRetry() {
+        replyCode = 429
+        replyBody = """{"detail":{"code":"google_quota_wait","retryable":true,"retry_after_seconds":300}}"""
+        assertEquals(300L, runSync())
+        reopen()
+        assertAudioAndReceiptsPreserved()
+        assertEquals(RemoteState.WAITING_FOR_QUOTA, store.session(id)!!.remoteState)
+        assertTrue(runSync()!! > 290L)
+        assertReadOnly() // User retry cannot make another HTTP request before the quota deadline.
+    }
+
+    @Test fun reconciliationFlagBlocksPurgeEvenWithContradictoryProofFlags() {
+        replyBody = progress().put("reconciliation_required", true).toString()
+        assertNotNull(runSync())
+        reopen()
+        assertAudioAndReceiptsPreserved()
+        assertEquals(RemoteState.RECONCILIATION_REQUIRED, store.session(id)!!.remoteState)
+        assertReadOnly()
+    }
+
     private fun progress(state: String = "published_verified", verified: Boolean = true, purged: Boolean = true) =
         JSONObject().put("api_version", "2.0").put("session_id", id).put("state", state)
             .put("recording_finished", true).put("chunks_expected", 7).put("chunks_received", 7)

@@ -9,6 +9,8 @@ internal class SyncEngine(
     private val onProgress: () -> Unit = {},
 ) {
     private var nextDelay: Long? = null
+    private val trace = SyncTrace()
+    private var readbackOnly = false
     private fun schedule(seconds: Long) {
         nextDelay = minOf(nextDelay ?: Long.MAX_VALUE, seconds)
     }
@@ -30,60 +32,76 @@ internal class SyncEngine(
     ): Long? {
         nextDelay = null
         val session = store.session(sessionId) ?: return null
+        readbackOnly = session.protocolVersion >= 2 && session.completeSent
+        trace.begin(if (readbackOnly) "status" else "create")
         if (session.captureState != CaptureState.FINISHED && session.captureState != CaptureState.PAUSED) return null
         val due = session.retryAtEpochMs?.let { VoiceIntakeV2Policy.delaySecondsUntil(it) } ?: 0L
         if (due > 0L && (!userInitiated || session.remoteState == RemoteState.WAITING_FOR_QUOTA)) return due
-        if (DeliveryPolicy.mayDeleteAudio(session.remoteState, session.githubVerified, session.serverAudioPurged)) {
-            return if (store.deleteVerifiedAudio(sessionId)) null else 60L
-        }
         try {
             cancellation.check()
-            if (session.protocolVersion >= 2) syncV2(store, ApiClientV2(url, token, cancellation), session)
+            if (DeliveryPolicy.mayDeleteAudio(session.remoteState, session.githubVerified, session.serverAudioPurged)) {
+                trace.phase = "local_purge"
+                return if (store.deleteVerifiedAudio(sessionId)) null else 60L
+            }
+            if (session.protocolVersion >= 2) syncV2(store, ApiClientV2(url, token, cancellation, trace), session)
             else syncLegacyV1(store, ApiClientV1(url, token, cancellation), session)
         } catch (exc: CancellationException) {
             throw exc
         } catch (exc: ApiException) {
             cancellation.check()
-            if (session.remoteState == RemoteState.RECONCILIATION_REQUIRED) schedule(300L)
-            else handleApiFailure(store, sessionId, exc)
+            if (readbackOnly || session.remoteState == RemoteState.RECONCILIATION_REQUIRED) {
+                val reconcile = session.remoteState == RemoteState.RECONCILIATION_REQUIRED ||
+                    !exc.retryable || exc.code == "chunks_missing" ||
+                    VoiceIntakeV2Policy.requiresManualReconciliation(exc.code, exc.reconciliationRequired)
+                val quota = !reconcile && (VoiceIntakeV2Policy.isQuotaCode(exc.code) || trace.httpStatus == 429)
+                val delay = VoiceIntakeV2Policy.retryDelaySeconds(exc.retryAfterSeconds,
+                    if (quota) QUOTA_FALLBACK_SECONDS else NETWORK_RETRY_SECONDS)
+                recordFailure(store, sessionId, exc, reconcile, delay, quota)
+            } else {
+                handleApiFailure(store, sessionId, exc)
+            }
         } catch (exc: IllegalArgumentException) {
-            store.setRemoteState(sessionId, RemoteState.RECONCILIATION_REQUIRED, exc.message)
-            schedule(300L)
+            recordFailure(store, sessionId, exc, true)
         } catch (exc: IllegalStateException) {
-            store.setRemoteState(sessionId, RemoteState.RECONCILIATION_REQUIRED, exc.message)
-            schedule(300L)
+            recordFailure(store, sessionId, exc, true)
         } catch (exc: Exception) {
             cancellation.check()
-            if (session.remoteState != RemoteState.RECONCILIATION_REQUIRED) {
-                store.setRetryableError(sessionId, 30L, "Передача прервана; аудио сохранено, повтор запланирован")
-            }
-            schedule(30L)
+            recordFailure(store, sessionId, exc, session.remoteState == RemoteState.RECONCILIATION_REQUIRED)
         }
         onProgress()
         return nextDelay
     }
 
     private fun syncV2(store: SessionStore, api: ApiClientV2, original: SessionSnapshot) {
-        // Authoritative v2 rule: every pass starts with durable idempotent create/re-open.
-        val initialized = if (original.remoteState == RemoteState.RECONCILIATION_REQUIRED) {
-            try { api.status(original.sessionId) } catch (exc: ApiException) {
-                if (exc.code == "session_not_found" || exc.code == "http_404") {
-                    schedule(300L)
-                    return
-                }
-                throw exc
-            }
-        } else api.createSession(original, store)
-        if (original.remoteState == RemoteState.RECONCILIATION_REQUIRED) {
-            if (initialized.isVerifiedAndPurged()) {
-                store.updateRemoteProgress(original.sessionId, initialized)
-                deleteLocalAudioOrRetry(store, original.sessionId)
-            } else {
-                // Observe repairs without reopening uploads or replaying complete.
+        if (original.completeSent || original.remoteState == RemoteState.RECONCILIATION_REQUIRED) {
+            // A durable accepted complete cannot be undone by a later response or HTTP failure.
+            // Never POST create/complete, PUT chunks or reset receipt flags in this branch.
+            trace.begin("status")
+            val progress = api.status(original.sessionId)
+            if (!progress.recordingFinished || progress.chunksUploaded != original.chunkCount ||
+                store.chunks(original.sessionId).size != original.chunkCount
+            ) {
+                store.setRemoteState(original.sessionId, RemoteState.RECONCILIATION_REQUIRED,
+                    "Подтверждение сервера противоречит принятому завершению; аудио сохранено, нужна сверка")
                 schedule(300L)
+                return
             }
+            if (original.remoteState == RemoteState.RECONCILIATION_REQUIRED &&
+                (!progress.isVerifiedAndPurged() || progress.reconciliationRequired)
+            ) {
+                schedule(300L)
+                return
+            }
+            trace.phase = "save_progress"
+            store.updateRemoteProgress(original.sessionId, progress)
+            handleV2Progress(store, original.sessionId, progress)
             return
         }
+
+        trace.begin("create")
+        val initialized = api.createSession(original, store)
+        readbackOnly = initialized.recordingFinished
+        trace.phase = "reconcile_receipts"
         if (!store.reconcileV2ServerState(
                 original.sessionId,
                 initialized.chunksUploaded,
@@ -99,6 +117,7 @@ internal class SyncEngine(
             return
         }
         store.markServerInitialized(original.sessionId)
+        trace.phase = "save_progress"
         store.updateRemoteProgress(original.sessionId, initialized)
 
         if (initialized.isVerifiedAndPurged()) {
@@ -129,7 +148,9 @@ internal class SyncEngine(
         for (chunk in store.pendingChunks(session)) {
             store.setRemoteState(session.sessionId, RemoteState.RECEIVING)
             cancellation.check()
+            trace.begin("upload")
             api.uploadChunk(chunk)
+            trace.phase = "save_chunk_receipt"
             store.markChunkUploaded(session.sessionId, chunk.chunkIndex)
             onProgress()
         }
@@ -151,12 +172,18 @@ internal class SyncEngine(
         }
 
         val progress = if (!session.completeSent) {
-            api.completeSession(session, chunks).also { store.markCompleteSent(session.sessionId) }
+            trace.begin("complete")
+            api.completeSession(session, chunks).also {
+                trace.phase = "save_complete_receipt"
+                store.markCompleteSent(session.sessionId)
+                readbackOnly = true
+            }
         } else {
-            val current = api.status(session.sessionId)
-            if (DeliveryPolicy.maySendComplete(current.recordingFinished)) api.completeSession(session, chunks)
-            else current
+            readbackOnly = true
+            trace.begin("status")
+            api.status(session.sessionId)
         }
+        trace.phase = "save_progress"
         store.updateRemoteProgress(session.sessionId, progress)
         handleV2Progress(store, session.sessionId, progress)
     }
@@ -167,7 +194,6 @@ internal class SyncEngine(
         progress: RemoteProgress,
     ) {
         when {
-            progress.isVerifiedAndPurged() -> deleteLocalAudioOrRetry(store, sessionId)
             progress.reconciliationRequired ||
                 progress.state == RemoteState.RECONCILIATION_REQUIRED ||
                 VoiceIntakeV2Policy.requiresManualReconciliation(
@@ -181,6 +207,7 @@ internal class SyncEngine(
                 )
                 schedule(300L)
             }
+            progress.isVerifiedAndPurged() -> deleteLocalAudioOrRetry(store, sessionId)
             progress.state == RemoteState.WAITING_FOR_QUOTA -> {
                 val delay = VoiceIntakeV2Policy.retryDelaySeconds(
                     progress.retryAfterSeconds,
@@ -221,6 +248,7 @@ internal class SyncEngine(
     }
 
     private fun deleteLocalAudioOrRetry(store: SessionStore, sessionId: String) {
+        trace.phase = "local_purge"
         if (!store.deleteVerifiedAudio(sessionId)) {
             schedule(LOCAL_PURGE_RETRY_SECONDS)
         }
@@ -230,6 +258,7 @@ internal class SyncEngine(
         // Compatibility repair for unfinished v1 rows; the v1 wire contract remains unchanged.
         val initialized = api.createSession(original)
         store.markServerInitialized(original.sessionId)
+        trace.phase = "save_progress"
         store.updateRemoteProgress(original.sessionId, initialized)
         if (initialized.isVerifiedAndPurged()) {
             deleteLocalAudioOrRetry(store, original.sessionId)
@@ -270,7 +299,32 @@ internal class SyncEngine(
         }
     }
 
+    private fun recordFailure(
+        store: SessionStore, sessionId: String, exc: Exception, reconcile: Boolean,
+        delaySeconds: Long = NETWORK_RETRY_SECONDS, quota: Boolean = false,
+    ) {
+        val message = (if (readbackOnly) {
+            "Не удалось получить или сохранить подтверждение публикации; аудио сохранено. Повторяется только чтение статуса."
+        } else {
+            "Операция не завершена; аудио сохранено."
+        }) + "\n" + trace.describe(exc)
+        // last_error is already durable across process/DB reopen; no new diagnostic DB or payload logs.
+        android.util.Log.w("RIHSync", message)
+        try {
+            if (reconcile) store.setRemoteState(sessionId, RemoteState.RECONCILIATION_REQUIRED, message)
+            else if (quota) store.setQuotaWait(sessionId, delaySeconds, message)
+            else store.setRetryableError(sessionId, delaySeconds, message)
+        } catch (persistenceFailure: Exception) {
+            // Do not replace the original diagnosis with a raw SQLite/OS exception message.
+            trace.phase = "save_failure"
+            android.util.Log.w("RIHSync", trace.describe(persistenceFailure))
+        }
+        schedule(if (reconcile) 300L else delaySeconds)
+    }
+
     private fun handleApiFailure(store: SessionStore, sessionId: String, exc: ApiException) {
+        val safeMessage = "Операция не завершена; аудио сохранено.\n" + trace.describe(exc)
+        android.util.Log.w("RIHSync", safeMessage)
         if (
             exc.code == "session_not_created" ||
             exc.code.contains("session_not_initialized") ||
@@ -279,13 +333,13 @@ internal class SyncEngine(
             store.setRetryableError(
                 sessionId,
                 CREATE_RETRY_SECONDS,
-                exc.message ?: "Серверная сессия будет создана повторно",
+                safeMessage,
             )
             schedule(CREATE_RETRY_SECONDS)
             return
         }
         if (VoiceIntakeV2Policy.requiresManualReconciliation(exc.code, exc.reconciliationRequired)) {
-            store.setRemoteState(sessionId, RemoteState.RECONCILIATION_REQUIRED, exc.message)
+            store.setRemoteState(sessionId, RemoteState.RECONCILIATION_REQUIRED, safeMessage)
             schedule(300L)
             return
         }
@@ -295,13 +349,13 @@ internal class SyncEngine(
                 store.setRetryableError(
                     sessionId,
                     UPLOAD_RETRY_SECONDS,
-                    exc.message ?: "Сервер запросил повторную проверку сегментов",
+                    safeMessage,
                 )
                 schedule(UPLOAD_RETRY_SECONDS)
                 return
             }
             "device_token_required", "device_token_invalid" -> {
-                store.setRemoteState(sessionId, RemoteState.RETRYABLE_ERROR, exc.message)
+                store.setRemoteState(sessionId, RemoteState.RETRYABLE_ERROR, safeMessage)
                 return
             }
         }
@@ -309,7 +363,7 @@ internal class SyncEngine(
             store.setRemoteState(
                 sessionId,
                 RemoteState.RECONCILIATION_REQUIRED,
-                exc.message ?: "Сервер отклонил неизменяемые данные; аудио сохранено",
+                safeMessage,
             )
             return
         }
@@ -326,10 +380,10 @@ internal class SyncEngine(
             store.setQuotaWait(
                 sessionId,
                 delay,
-                exc.message ?: "Ожидание доступного лимита Gemini",
+                safeMessage,
             )
         } else {
-            store.setRetryableError(sessionId, delay, exc.message)
+            store.setRetryableError(sessionId, delay, safeMessage)
         }
         schedule(delay)
     }

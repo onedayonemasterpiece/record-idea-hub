@@ -11,17 +11,16 @@ android {
         applicationId = "com.onedayonemasterpiece.recordideahub"
         minSdk = 29
         targetSdk = 36
-        versionCode = 5
-        versionName = "1.1.0-rc4"
+        versionCode = 6
+        versionName = "1.1.0-rc5-readback"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
         debug {
-            // GitHub-hosted runners generate a different default debug certificate per run.
-            // A distinct beta package lets OpenCode install Android 1.1 alongside the working
-            // v1 APK without uninstalling it or risking the urgent review workflow.
+            // Preserve the installed RC4 package and its queue. This suffix does NOT establish
+            // signing compatibility; the installed certificate must match for any update.
             applicationIdSuffix = ".v11"
             // Evidence builds must not invent another incompatible Android debug identity.
             if (providers.gradleProperty("unsignedEvidence").orNull == "true") {

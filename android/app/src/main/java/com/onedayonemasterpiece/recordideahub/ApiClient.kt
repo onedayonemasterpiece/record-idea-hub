@@ -73,8 +73,13 @@ class ApiClientV1(baseUrl: String, token: String, cancellation: TransferCancella
     }
 }
 
-class ApiClientV2(baseUrl: String, token: String, cancellation: TransferCancellation = TransferCancellation()) {
-    private val http = VoiceHttpClient(baseUrl, token, cancellation)
+class ApiClientV2(
+    baseUrl: String,
+    token: String,
+    cancellation: TransferCancellation = TransferCancellation(),
+    trace: SyncTrace = SyncTrace(),
+) {
+    private val http = VoiceHttpClient(baseUrl, token, cancellation, trace)
 
     fun createSession(session: SessionSnapshot, store: SessionStore): RemoteProgress =
         http.jsonRequest("POST", "$API_ROOT/sessions", store.createPayload(session.sessionId) {
@@ -184,6 +189,7 @@ class ApiClientV2(baseUrl: String, token: String, cancellation: TransferCancella
 
 private class VoiceHttpClient(
     baseUrl: String, private val token: String, private val cancellation: TransferCancellation,
+    private val trace: SyncTrace = SyncTrace(),
 ) {
     private val serviceBaseUrl = VoiceIntakeV2Policy.normalizeServiceBaseUrl(baseUrl)
 
@@ -220,11 +226,14 @@ private class VoiceHttpClient(
 
     private fun request(method: String, path: String, body: (HttpURLConnection) -> Unit): JSONObject {
         cancellation.check()
+        trace.phase = "open_connection"
         val connection = open(method, path)
         try {
             cancellation.attach(connection)
+            trace.phase = "write_request"
             body(connection)
             cancellation.check()
+            trace.phase = "read_response"
             return readJson(connection)
         } finally {
             cancellation.detach(connection)
@@ -246,10 +255,14 @@ private class VoiceHttpClient(
     private fun readJson(connection: HttpURLConnection): JSONObject {
         try {
             val code = connection.responseCode
+            trace.httpStatus = code
             val stream = if (code in 200..299) connection.inputStream else connection.errorStream
             val text = stream?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readText() }.orEmpty()
             if (code !in 200..299) throw parseError(code, text)
-            return if (text.isBlank()) JSONObject() else JSONObject(text)
+            trace.phase = "parse_json"
+            return (if (text.isBlank()) JSONObject() else JSONObject(text)).also {
+                trace.phase = "parse_receipt"
+            }
         } finally {
             connection.disconnect()
         }
