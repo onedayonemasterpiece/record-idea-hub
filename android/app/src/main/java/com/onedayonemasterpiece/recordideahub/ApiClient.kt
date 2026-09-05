@@ -11,8 +11,8 @@ import java.time.OffsetDateTime
 import java.util.Locale
 import kotlin.math.ceil
 
-class ApiClientV1(baseUrl: String, token: String) {
-    private val http = VoiceHttpClient(baseUrl, token)
+class ApiClientV1(baseUrl: String, token: String, cancellation: TransferCancellation = TransferCancellation()) {
+    private val http = VoiceHttpClient(baseUrl, token, cancellation)
 
     fun createSession(session: SessionSnapshot): RemoteProgress = http.jsonRequest(
         "POST", "$API_ROOT/sessions", JSONObject()
@@ -73,10 +73,20 @@ class ApiClientV1(baseUrl: String, token: String) {
     }
 }
 
-class ApiClientV2(baseUrl: String, token: String) {
-    private val http = VoiceHttpClient(baseUrl, token)
+class ApiClientV2(
+    baseUrl: String,
+    token: String,
+    cancellation: TransferCancellation = TransferCancellation(),
+    trace: SyncTrace = SyncTrace(),
+) {
+    private val http = VoiceHttpClient(baseUrl, token, cancellation, trace)
 
-    fun createSession(session: SessionSnapshot): RemoteProgress {
+    fun createSession(session: SessionSnapshot, store: SessionStore): RemoteProgress =
+        http.jsonRequest("POST", "$API_ROOT/sessions", store.createPayload(session.sessionId) {
+            creationPayload(session).toString()
+        }.toByteArray(StandardCharsets.UTF_8)).requireV2Session(session.sessionId).toProgressV2()
+
+    internal fun creationPayload(session: SessionSnapshot): JSONObject {
         val body = JSONObject()
             .put("session_id", session.sessionId)
             .put("started_at", session.startedAt)
@@ -107,9 +117,7 @@ class ApiClientV2(baseUrl: String, token: String) {
                     .put("config_version", EfficientVad.CONFIG_VERSION),
             )
         }
-        return http.jsonRequest("POST", "$API_ROOT/sessions", body.toBytes())
-            .requireV2Session(session.sessionId)
-            .toProgressV2()
+        return body
     }
 
     fun uploadChunk(chunk: ChunkRecord): ChunkUploadReceipt {
@@ -179,31 +187,58 @@ class ApiClientV2(baseUrl: String, token: String) {
     }
 }
 
-private class VoiceHttpClient(baseUrl: String, private val token: String) {
+private class VoiceHttpClient(
+    baseUrl: String, private val token: String, private val cancellation: TransferCancellation,
+    private val trace: SyncTrace = SyncTrace(),
+) {
     private val serviceBaseUrl = VoiceIntakeV2Policy.normalizeServiceBaseUrl(baseUrl)
 
-    fun jsonRequest(method: String, path: String, body: ByteArray?): JSONObject {
-        val connection = open(method, path)
-        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-        if (body != null) {
-            connection.doOutput = true
-            connection.setFixedLengthStreamingMode(body.size)
-            connection.outputStream.use { it.write(body) }
+    fun jsonRequest(method: String, path: String, body: ByteArray?): JSONObject =
+        request(method, path) { connection ->
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            if (body != null) {
+                connection.doOutput = true
+                connection.setFixedLengthStreamingMode(body.size)
+                connection.outputStream.use { it.write(body) }
+            }
         }
-        return readJson(connection)
-    }
 
     fun upload(path: String, file: File, mimeType: String, headers: Map<String, String>): JSONObject {
-        require(file.isFile) { "missing local audio chunk ${file.absolutePath}" }
-        val connection = open("PUT", path)
-        connection.setRequestProperty("Content-Type", mimeType)
-        headers.forEach(connection::setRequestProperty)
-        connection.setFixedLengthStreamingMode(file.length())
-        connection.doOutput = true
-        file.inputStream().use { input ->
-            connection.outputStream.use { output -> input.copyTo(output) }
+        require(file.isFile) { "missing local audio chunk" }
+        return request("PUT", path) { connection ->
+            connection.setRequestProperty("Content-Type", mimeType)
+            headers.forEach(connection::setRequestProperty)
+            connection.setFixedLengthStreamingMode(file.length())
+            connection.doOutput = true
+            file.inputStream().use { input ->
+                connection.outputStream.use { output ->
+                    val buffer = ByteArray(32 * 1024)
+                    while (true) {
+                        cancellation.check()
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        output.write(buffer, 0, count)
+                    }
+                }
+            }
         }
-        return readJson(connection)
+    }
+
+    private fun request(method: String, path: String, body: (HttpURLConnection) -> Unit): JSONObject {
+        cancellation.check()
+        trace.phase = "open_connection"
+        val connection = open(method, path)
+        try {
+            cancellation.attach(connection)
+            trace.phase = "write_request"
+            body(connection)
+            cancellation.check()
+            trace.phase = "read_response"
+            return readJson(connection)
+        } finally {
+            cancellation.detach(connection)
+            connection.disconnect()
+        }
     }
 
     private fun open(method: String, path: String): HttpURLConnection =
@@ -220,10 +255,14 @@ private class VoiceHttpClient(baseUrl: String, private val token: String) {
     private fun readJson(connection: HttpURLConnection): JSONObject {
         try {
             val code = connection.responseCode
+            trace.httpStatus = code
             val stream = if (code in 200..299) connection.inputStream else connection.errorStream
             val text = stream?.bufferedReader(StandardCharsets.UTF_8)?.use { it.readText() }.orEmpty()
             if (code !in 200..299) throw parseError(code, text)
-            return if (text.isBlank()) JSONObject() else JSONObject(text)
+            trace.phase = "parse_json"
+            return (if (text.isBlank()) JSONObject() else JSONObject(text)).also {
+                trace.phase = "parse_receipt"
+            }
         } finally {
             connection.disconnect()
         }

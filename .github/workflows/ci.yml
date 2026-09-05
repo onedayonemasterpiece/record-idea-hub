@@ -19,7 +19,7 @@ env:
 
 jobs:
   android:
-    name: Android checks and installable debug APK
+    name: Android checks and unsigned APK evidence
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -47,18 +47,39 @@ jobs:
       - name: Lint, test and assemble
         run: >-
           gradle -p android --no-daemon --stacktrace
-          lintDebug testDebugUnitTest assembleDebug
-      - name: Prepare versioned APK artifact
+          -PunsignedEvidence=true lintDebug testDebugUnitTest assembleDebug
+      - name: Prepare unsigned APK evidence (NOT an update)
         shell: bash
         run: |
           mkdir -p artifacts
-          cp android/app/build/outputs/apk/debug/app-debug.apk \
-            artifacts/record-idea-hub-1.1.0-rc3-debug.apk
-          (cd artifacts && sha256sum record-idea-hub-1.1.0-rc3-debug.apk > SHA256SUMS.txt)
-      - name: Upload installable Android 1.1 RC3 APK
+          mapfile -t APKS < <(find android/app/build/outputs/apk/debug -maxdepth 1 -name '*.apk')
+          test "${#APKS[@]}" -eq 1
+          cp "${APKS[0]}" artifacts/record-idea-hub-readback-unsigned.apk
+          (cd artifacts && sha256sum record-idea-hub-readback-unsigned.apk > SHA256SUMS.txt)
+          git rev-parse HEAD > artifacts/SOURCE_SHA.txt
+          printf '%s\n' 'UNSIGNED — DO NOT INSTALL. RC4 matching private key has not been established.' > artifacts/SIGNING-CERTIFICATE.txt
+          printf '%s\n' 'Expected installed RC4 certificate SHA256: d76232a3b9b298bb31f244dcd47a8f8d8cf2f8c02501cd8a46f2f6aea0694a95' >> artifacts/SIGNING-CERTIFICATE.txt
+          test ! -f "$HOME/.android/debug.keystore"
+      - name: Upload unsigned readback APK evidence
         uses: actions/upload-artifact@v7
         with:
-          name: record-idea-hub-1.1-rc3-apk
+          name: record-idea-hub-readback-unsigned-apk
           path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Prepare verification evidence
+        if: always()
+        run: |
+          mkdir -p verification
+          git rev-parse HEAD > verification/SOURCE_SHA.txt
+          git archive --format=tar HEAD > verification/source.tar
+          if [ -d android/app/build/reports ]; then cp -r android/app/build/reports verification/; fi
+          if [ -d android/app/build/test-results ]; then cp -r android/app/build/test-results verification/; fi
+      - name: Upload verification reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: record-idea-hub-verification
+          path: verification/
           if-no-files-found: error
           retention-days: 14

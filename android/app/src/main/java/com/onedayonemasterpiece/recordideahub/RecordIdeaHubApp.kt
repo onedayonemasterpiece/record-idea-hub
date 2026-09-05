@@ -44,6 +44,6 @@ class RecordIdeaHubApp : Application() {
                     )
                 }
             }
-        SyncScheduler.enqueue(this)
+        SyncScheduler.initialize(this)
     }
 }

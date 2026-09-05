@@ -1,96 +1,113 @@
 # OpenCode / ADB maintenance handoff
 
-The initial Samsung S21 Ultra acceptance is complete. Use this document for reinstalling a later build, reproducing a confirmed defect or validating a focused follow-up change. Do not remove the working Android 1.0 package unless explicitly requested.
+The previous Samsung S21 Ultra acceptance does not prove RC4 physical behavior.
+For this rollout, server Codex deploys ONLY the backend. Local OpenCode downloads
+an ALREADY BUILT CI APK, updates the phone and performs one focused smoke.
+Never uninstall either populated package to work around signing.
 
-## Current packages
+Task documents:
 
-```text
-Android 1.0:
-com.onedayonemasterpiece.recordideahub
+- [Codex: backend only](handoffs/20260905-codex-server-rollout.md)
+- [OpenCode: existing CI APK and phone smoke](handoffs/20260905-opencode-phone-smoke.md)
 
-Android 1.1 side-by-side build:
-com.onedayonemasterpiece.recordideahub.v11
-```
-
-## Obtain the APK
-
-Use the latest successful `Android CI and APK` run on `main`. The current workflow artifact is:
+## Packages
 
 ```text
-record-idea-hub-1.1-rc3-apk
+Android 1.0 (do not remove): com.onedayonemasterpiece.recordideahub
+Android 1.1 / RC4 target:    com.onedayonemasterpiece.recordideahub.v11
 ```
 
-Example:
+## Existing APK — not a server deliverable
+
+The verified RC4 APK already exists in `onedayonemasterpiece/record-idea-hub`:
+
+```text
+run_id:           33953071610
+artifact_id:      9965493810
+artifact_name:    record-idea-hub-1.1-rc4-apk
+apk_filename:     record-idea-hub-1.1.0-rc4-debug.apk
+apk_sha256:       1296361f1634c81f3d367561e0ac45c63d8321ede4ffa751a95446fab4a4ed84
+certificate_sha256: d76232a3b9b298bb31f244dcd47a8f8d8cf2f8c02501cd8a46f2f6aea0694a95
+PR head SHA:      d9441d057501bd49b6d66b0f653c96ffa0bf859c
+Built merge SHA:  b73eadeb85114456247fcb6ba52df77f01985825
+version:          1.1.0-rc4 / versionCode 5
+```
+
+The built merge SHA is the tested PR ref, not a claim that main was updated.
+SOURCE_SHA.txt describes that tested ref. Later documentation-only commits do
+not require rebuilding the unchanged APK. APK SHA256 is not the artifact ZIP hash.
 
 ```bash
-REPO=onedayonemasterpiece/record-idea-hub
-RUN_ID="$(gh run list -R "$REPO" --workflow ci.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
-rm -rf .tmp-record-idea-apk
-mkdir -p .tmp-record-idea-apk
-gh run download -R "$REPO" "$RUN_ID" -n record-idea-hub-1.1-rc3-apk -D .tmp-record-idea-apk
-APK="$(find .tmp-record-idea-apk -name '*.apk' -type f -print -quit)"
-test -f "$APK"
-sha256sum "$APK"
+gh run download 33953071610 -R onedayonemasterpiece/record-idea-hub \
+  -n record-idea-hub-1.1-rc4-apk -D "$NEW_OUTPUT_DIR"
 ```
 
-Record run ID, head SHA, artifact ID/name and APK SHA-256. Do not substitute a local build for final evidence.
+Verify run success, artifact identity, source identities, APK SHA256 and
+`apksigner verify --print-certs`. Do not select arbitrary latest/main builds.
+Do not ask server Codex to create, download, sign or hand over an APK or merge
+Android #5. Main-only installation and new post-merge build requirements are removed.
 
-## Install side by side
+Separately read `my-data-hub#39` for the actual backend deployment/smoke result,
+normally marked `BACKEND_READY`. A previous `READY_FOR_PHONE` report is usable
+only if it provides actual deployed-source/API/worker evidence. A mandatory
+`docs/verification/20260905-server-rollout.json` is no longer required: a factual
+comment in #39 suffices. Download/signature checks may precede backend readiness;
+installation and a live recording require the backend confirmation.
+
+## In-place update
 
 ```bash
 adb devices -l
-adb install -r "$APK"
+adb -s "$SERIAL" shell pm path com.onedayonemasterpiece.recordideahub.v11
 ```
 
-If only the previous 1.1 debug signature conflicts, remove exactly this package and reinstall:
+Select the authorized device explicitly. Do not bypass RSA/device lock. Confirm
+no recording is active, record the current version/unfinished queue, and keep
+a consistent private backup where accessible. A live SQLite copy without WAL
+or coordination is not a consistent backup; encrypted preferences do not
+replace Android Keystore. Never publish the backup, credentials or personal audio.
+
+Pull the installed base.apk and compare its signing certificate with the
+candidate. When the signature is compatible and this is not a downgrade:
 
 ```bash
-adb uninstall com.onedayonemasterpiece.recordideahub.v11
-adb install "$APK"
+adb -s "$SERIAL" install -r "$APK"
 ```
 
-Never remove `com.onedayonemasterpiece.recordideahub` as part of 1.1 maintenance.
+Skip reinstalling an identical installed build. CI DEBUG does not prove the
+same signing identity. For a mismatch, check only the known local debug.keystore
+and documented project signing store. An accessible matching original key may
+sign a copy of the verified APK without changing its code/resources/package;
+record original and installed hashes separately. Do not publish the private key.
+If there is no matching key, report `BLOCKED_SIGNATURE` and retain the queue.
+Do not generate a replacement key or pass the APK task to server Codex.
+Never use `adb uninstall`, `pm clear`, `-d`, root or signature-check bypasses.
 
-Grant permissions:
+## Configuration and permissions
+
+Retain existing backend configuration and device token. Do not re-provision a
+working token just because the APK changed. Grant only missing permissions
+through the normal device/ADB flow:
 
 ```bash
 PKG=com.onedayonemasterpiece.recordideahub.v11
-adb shell pm grant "$PKG" android.permission.RECORD_AUDIO
-adb shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS || true
+adb -s "$SERIAL" shell pm grant "$PKG" android.permission.RECORD_AUDIO
+# Android 13+ only, when missing:
+adb -s "$SERIAL" shell pm grant "$PKG" android.permission.POST_NOTIFICATIONS
 ```
 
-## Provisioning
+For genuinely unconfigured installations use the existing approved private
+provisioning process. Expected server origin: `https://mcp-datahub.kenigevents.ru`.
+Debug activity:
+`com.onedayonemasterpiece.recordideahub.v11/com.onedayonemasterpiece.recordideahub.MainActivity`.
+Debug extras `server_url` and `device_token` are supported, but never embed
+literal credentials in generated scripts, shell history, tool output or reports.
+Google/Supabase/GitHub credentials never go to the phone.
 
-Inputs are private and must not be printed in logs or reports:
+## One focused smoke
 
-```text
-SERVER_URL=https://mcp-datahub.kenigevents.ru
-DEVICE_TOKEN=<single-device bearer token>
-```
-
-Debug provisioning:
-
-```bash
-set +x
-adb shell am start \
-  -n com.onedayonemasterpiece.recordideahub.v11/com.onedayonemasterpiece.recordideahub.MainActivity \
-  --es server_url "$SERVER_URL" \
-  --es device_token "$DEVICE_TOKEN"
-unset DEVICE_TOKEN
-```
-
-The application stores the token through Android Keystore-backed encryption. Google, Supabase and GitHub credentials never go to the phone.
-
-## Focused smoke test
-
-1. Start recording.
-2. Observe automatic-silence state during quiet input: microphone remains active, saved-audio timer is stopped.
-3. Speak a short control sentence.
-4. Use manual pause: microphone must stop.
-5. Resume, speak another sentence and finish.
-6. Confirm local files are AAC-LC/M4A, mono 16 kHz.
-7. Observe `/voice-intake/v2` progress through upload, transcription, summary, publication and readback.
-8. Terminal status must be:
+Follow the phone handoff: short nonpersonal speech, Finish, immediate screen-off,
+observe delivery, then verify the actual IdeaHub packet and all confirmations:
 
 ```text
 published_verified
@@ -98,65 +115,37 @@ github_verified=true
 server_audio_purged=true
 ```
 
-9. Confirm local M4A files are deleted only after that terminal state.
+Verify local test-audio cleanup only after these confirmations and preserve
+older unfinished recordings. Do not equate upload-only, HTTP 401 or a UI stage
+counter with end-to-end success. Network interruption is optional when easy;
+long-duration/Doze/process-death/reboot matrices are not required for this smoke.
 
-## Binary-safe M4A extraction
+## Targeted diagnostics
 
-Use `exec-out` with a binary-safe host process, not a text shell redirect:
+Use app/time-window logs rather than deleting global device logs. Record exact
+APK/source identity, model/Android, session_id, failed transition, safe backend
+status, GitHub commit/path and purge result. Do not publish full logs, tokens,
+personal transcript or backup. A clipped icon or nonfatal MPEG4Writer warning
+is not a blocker without a correlated crash or invalid/lost audio.
+
+If a confirmed media defect needs extraction, use a binary-safe host process:
 
 ```python
 import subprocess
 from pathlib import Path
 
 adb = r"<absolute adb path>"
+serial = "<selected authorized device>"
 pkg = "com.onedayonemasterpiece.recordideahub.v11"
 remote = "files/audio/<actual-file>.m4a"
-local = Path(r"<evidence-directory>/sample.m4a")
-
+local = Path(r"<private-evidence-directory>/sample.m4a")
 with local.open("wb") as output:
     subprocess.run(
-        [adb, "exec-out", "run-as", pkg, "cat", remote],
-        stdout=output,
-        check=True,
+        [adb, "-s", serial, "exec-out", "run-as", pkg, "cat", remote],
+        stdout=output, check=True,
     )
 ```
 
-Validate with `ffprobe`: MP4/M4A container, AAC-LC, 16 kHz, mono and approximately 32 kbit/s.
-
-## Diagnostics
-
-Before reproduction:
-
-```bash
-adb logcat -c
-PID="$(adb shell pidof -s com.onedayonemasterpiece.recordideahub.v11)"
-adb logcat --pid="$PID"
-```
-
-Useful evidence:
-
-```bash
-adb shell dumpsys activity services com.onedayonemasterpiece.recordideahub.v11
-adb shell dumpsys thermalservice
-adb shell run-as com.onedayonemasterpiece.recordideahub.v11 ls -la files/audio databases shared_prefs
-```
-
-Record:
-
-- exact app/main commit and APK SHA;
-- device model, Android/One UI and build fingerprint;
-- `session_id`;
-- state transition where the defect occurred;
-- safe typed backend error/status;
-- M4A metadata and file size;
-- IdeaHub commit/source path;
-- whether server/local purge occurred.
-
-Never include device token, provider keys, audio bytes or full personal transcript in diagnostic reports.
-
-## Known non-blocking observations
-
-- A warm marker on the adaptive icon may be partially clipped by one OEM launcher mask.
-- Samsung may log `MPEG4Writer: Stop() called but track is not started or stopped` without crash or invalid M4A.
-
-Do not reopen the implementation batch for these alone. Create a focused follow-up only when the visual polish is prioritized or the media warning correlates with an actual corrupt/lost segment.
+Validate only when needed with ffprobe: M4A/MP4, AAC-LC, 16 kHz mono,
+approximately 32 kbit/s. Do not extract personal recordings to embellish a report.
+After one successful agreed smoke, save a short result in #5 and stop.

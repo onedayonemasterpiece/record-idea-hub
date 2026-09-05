@@ -43,7 +43,8 @@ class VoiceIntakeV2PolicyTest {
             retryAfterSeconds = null,
             reconciliationRequired = true,
         )
-        assertTrue(VoiceIntakeV2Policy.shouldRetryComplete(ready))
+        assertFalse(VoiceIntakeV2Policy.shouldRetryComplete(ready))
+        assertTrue(VoiceIntakeV2Policy.shouldRetryComplete(ready.copy(recordingFinished = false)))
         assertFalse(VoiceIntakeV2Policy.shouldRetryComplete(waiting))
         assertFalse(VoiceIntakeV2Policy.shouldRetryComplete(ambiguous))
     }
