@@ -52,7 +52,7 @@ internal object VoiceIntakeV2Policy {
 
     fun shouldRetryComplete(progress: RemoteProgress): Boolean =
         progress.state == RemoteState.RETRYABLE_ERROR &&
-            progress.retryable &&
+            !progress.recordingFinished && progress.retryable &&
             !progress.reconciliationRequired &&
             (progress.retryAfterSeconds == null || progress.retryAfterSeconds <= 0)
 

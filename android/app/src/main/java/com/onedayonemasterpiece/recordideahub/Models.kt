@@ -77,6 +77,8 @@ data class SessionSnapshot(
     val githubCommitSha: String?,
     val lastError: String?,
     val retryAtEpochMs: Long?,
+    val githubVerified: Boolean = false,
+    val serverAudioPurged: Boolean = false,
 )
 
 data class ChunkRecord(

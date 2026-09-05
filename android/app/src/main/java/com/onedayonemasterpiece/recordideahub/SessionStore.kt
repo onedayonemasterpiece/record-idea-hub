@@ -46,6 +46,9 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
                 retry_at_epoch_ms INTEGER,
                 manual_pause_started_epoch_ms INTEGER,
                 audio_deleted INTEGER NOT NULL DEFAULT 0,
+                create_payload_json TEXT,
+                github_verified INTEGER NOT NULL DEFAULT 0,
+                server_audio_purged INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             )
             """.trimIndent(),
@@ -95,6 +98,14 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
             db.execSQL("ALTER TABLE chunks ADD COLUMN mime_type TEXT NOT NULL DEFAULT 'audio/wav'")
             db.execSQL("DROP INDEX IF EXISTS idx_chunks_upload")
             db.execSQL("CREATE INDEX idx_chunks_upload ON chunks(session_id, uploaded, chunk_index)")
+        }
+        if (oldVersion < 4) {
+            db.execSQL("ALTER TABLE sessions ADD COLUMN create_payload_json TEXT")
+            db.execSQL("ALTER TABLE sessions ADD COLUMN github_verified INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("ALTER TABLE sessions ADD COLUMN server_audio_purged INTEGER NOT NULL DEFAULT 0")
+            // Old rows did not persist these confirmations. Re-read the server before
+            // deleting remaining files; already deleted audio is not recreated.
+            db.execSQL("UPDATE sessions SET remote_state='verifying' WHERE remote_state='published_verified' AND audio_deleted=0")
         }
     }
 
@@ -426,7 +437,7 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
             """
             ((protocol_version>=2 AND capture_state=?) OR
              (protocol_version<2 AND capture_state IN (?, ?)))
-            AND remote_state NOT IN (?, ?)
+            AND remote_state != ?
             AND (retry_at_epoch_ms IS NULL OR retry_at_epoch_ms<=?)
             """.trimIndent(),
             arrayOf(
@@ -434,13 +445,31 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
                 CaptureState.PAUSED,
                 CaptureState.FINISHED,
                 RemoteState.PUBLISHED_VERIFIED,
-                RemoteState.RECONCILIATION_REQUIRED,
                 nowEpochMs.toString(),
             ),
             null,
             null,
             "created_at ASC",
         ).use { cursor -> return buildList { while (cursor.moveToNext()) add(cursor.toSession()) } }
+    }
+
+    @Synchronized
+    fun createPayload(sessionId: String, factory: () -> String): String {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val existing = db.rawQuery("SELECT create_payload_json FROM sessions WHERE session_id=?", arrayOf(sessionId))
+                .use { cursor ->
+                    check(cursor.moveToFirst()) { "session disappeared before create" }
+                    if (cursor.isNull(0)) null else cursor.getString(0)
+                }
+            val payload = existing ?: factory().also {
+                db.update("sessions", ContentValues().apply { put("create_payload_json", it) },
+                    "session_id=?", arrayOf(sessionId))
+            }
+            db.setTransactionSuccessful()
+            return payload
+        } finally { db.endTransaction() }
     }
 
     @Synchronized
@@ -494,7 +523,12 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
         ).use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
         writableDatabase.update(
             "sessions", ContentValues().apply {
-                put("remote_state", progress.state)
+                val safeState = if (progress.state == RemoteState.PUBLISHED_VERIFIED &&
+                    !DeliveryPolicy.mayDeleteAudio(progress.state, progress.githubVerified, progress.serverAudioPurged)
+                ) RemoteState.VERIFYING else progress.state
+                put("remote_state", safeState)
+                put("github_verified", if (progress.githubVerified) 1 else 0)
+                put("server_audio_purged", if (progress.serverAudioPurged) 1 else 0)
                 put("chunks_uploaded", progress.chunksUploaded.coerceAtLeast(0))
                 if (progress.chunksTranscribed > 0 || progress.transcriptionComplete) {
                     put("chunks_transcribed", progress.chunksTranscribed)
@@ -568,7 +602,7 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
         val ids = readableDatabase.query(
             "sessions",
             arrayOf("session_id"),
-            "remote_state=? AND audio_deleted=0",
+            "remote_state=? AND github_verified=1 AND server_audio_purged=1 AND audio_deleted=0",
             arrayOf(RemoteState.PUBLISHED_VERIFIED),
             null,
             null,
@@ -583,6 +617,8 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
 
     @Synchronized
     fun deleteVerifiedAudio(sessionId: String): Boolean {
+        val current = session(sessionId) ?: return false
+        if (!DeliveryPolicy.mayDeleteAudio(current.remoteState, current.githubVerified, current.serverAudioPurged)) return false
         val failed = chunks(sessionId).filter { record ->
             if (record.path.isBlank()) return@filter false
             val file = File(record.path)
@@ -647,6 +683,8 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
         githubCommitSha = nullableString("github_commit_sha"),
         lastError = nullableString("last_error"),
         retryAtEpochMs = nullableLong("retry_at_epoch_ms"),
+        githubVerified = getInt(getColumnIndexOrThrow("github_verified")) != 0,
+        serverAudioPurged = getInt(getColumnIndexOrThrow("server_audio_purged")) != 0,
     )
 
     private fun Cursor.toChunk() = ChunkRecord(
@@ -675,13 +713,14 @@ class SessionStore(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, 
 
     companion object {
         private const val DB_NAME = "record-idea-hub.sqlite3"
-        private const val DB_VERSION = 3
+        private const val DB_VERSION = 4
         private val SESSION_COLUMNS = arrayOf(
             "session_id", "protocol_version", "started_at", "ended_at", "timezone", "device_label",
             "duration_ms", "wall_elapsed_ms", "manual_pause_ms", "auto_silence_skipped_ms",
             "chunk_count", "capture_state", "capture_activity", "capture_policy", "vad_engine",
             "remote_state", "server_initialized", "complete_sent", "poll_count", "chunks_uploaded",
             "chunks_transcribed", "github_url", "github_commit_sha", "last_error", "retry_at_epoch_ms",
+            "github_verified", "server_audio_purged",
         )
         private val CHUNK_COLUMNS = arrayOf(
             "session_id", "chunk_index", "start_ms", "end_ms", "wall_start_ms", "wall_end_ms",

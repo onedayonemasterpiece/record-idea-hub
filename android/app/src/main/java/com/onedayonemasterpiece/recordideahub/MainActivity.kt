@@ -293,6 +293,7 @@ class MainActivity : Activity() {
                 finish.visibility = View.GONE
             }
         }
+        retry.text = if (latest.remoteState == RemoteState.RECONCILIATION_REQUIRED) "Проверить результат" else "Повторить передачу"
         retry.visibility = if (latest.remoteState in setOf(
                 RemoteState.WAITING_FOR_QUOTA,
                 RemoteState.RETRYABLE_ERROR,
@@ -431,8 +432,8 @@ class MainActivity : Activity() {
 
     private fun retryLatest() {
         val session = store.latestSession() ?: return
-        store.setRemoteState(session.sessionId, RemoteState.RECEIVING, "Повтор запрошен; аудио сохранено")
-        SyncScheduler.enqueue(this)
+        // Do not erase a conflict, quota deadline, or inference ambiguity.
+        SyncScheduler.userTransfer(this, session.sessionId)
         refresh()
     }
 

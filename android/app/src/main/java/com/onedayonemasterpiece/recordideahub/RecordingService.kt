@@ -127,7 +127,7 @@ class RecordingService : Service() {
             autoSilenceSkippedMs = autoSkipped,
         )
         runtime.clear(active.sessionId)
-        SyncScheduler.enqueue(this)
+        SyncScheduler.userTransfer(this, active.sessionId)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         broadcast()
