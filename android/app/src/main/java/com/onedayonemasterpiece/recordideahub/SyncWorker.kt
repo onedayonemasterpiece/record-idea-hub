@@ -203,7 +203,7 @@ class SyncWorker(
                 store.setRetryableError(
                     sessionId,
                     delay,
-                    progress.errorCode ?: "Сервер временно не завершил обработку",
+                    progress.lastError ?: "Сервер повторит обработку автоматически; аудио сохранено",
                 )
                 SyncScheduler.enqueue(applicationContext, delay)
             }

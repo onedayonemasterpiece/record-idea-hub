@@ -413,7 +413,7 @@ private fun JSONObject.toProgressV2(): RemoteProgress {
         serverAudioPurged = purged,
         githubUrl = nullableString("github_url"),
         githubCommitSha = nullableString("github_commit_sha"),
-        lastError = null,
+        lastError = nullableString("status_message"),
         errorCode = nullableString("error_code"),
         retryable = optBoolean("retryable", false),
         retryAfterSeconds = retryAfter,
