@@ -352,8 +352,9 @@ class MainActivity : Activity() {
         }
         RemoteState.RECONCILIATION_REQUIRED -> "Gemini          ! требуется безопасная сверка"
         RemoteState.RETRYABLE_ERROR -> {
-            val error = session.lastError?.take(62).orEmpty()
-            if (error.isBlank()) "Процесс          ! данные сохранены" else "Процесс          ! $error"
+            val retryAt = session.retryAtEpochMs
+            if (retryAt != null) "Процесс          ◌ автоматический повтор в ${formatClock(retryAt)}"
+            else "Процесс          ! ${session.lastError?.take(62) ?: "аудио сохранено"}"
         }
         else -> "my-data-hub  ○ ожидает"
     }
